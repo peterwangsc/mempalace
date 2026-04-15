@@ -821,17 +821,32 @@ def status(palace_path: str):
         print("  Run: mempalace init <dir> then mempalace mine <dir>")
         return
 
-    # Count by wing and room
+    # Count by wing and room. Batched get() — ChromaDB's single-call get()
+    # binds one SQL variable per drawer ID under the hood, which blows
+    # past SQLite's SQLITE_MAX_VARIABLE_NUMBER (~32,766) once the palace
+    # crosses that threshold. Page in chunks so this scales to palaces
+    # with hundreds of thousands of drawers.
     total = col.count()
-    r = col.get(limit=total, include=["metadatas"]) if total else {"metadatas": []}
-    metas = r["metadatas"]
-
-    wing_rooms = defaultdict(lambda: defaultdict(int))
-    for m in metas:
-        wing_rooms[m.get("wing", "?")][m.get("room", "?")] += 1
+    wing_rooms: dict = defaultdict(lambda: defaultdict(int))
+    seen = 0
+    batch = 10_000
+    offset = 0
+    while offset < total:
+        try:
+            r = col.get(limit=batch, offset=offset, include=["metadatas"])
+        except Exception as e:
+            print(f"\n  (partial status: read failed at offset {offset}: {e})")
+            break
+        metas = r.get("metadatas") or []
+        if not metas:
+            break
+        for m in metas:
+            wing_rooms[m.get("wing", "?")][m.get("room", "?")] += 1
+        seen += len(metas)
+        offset += batch
 
     print(f"\n{'=' * 55}")
-    print(f"  MemPalace Status — {len(metas)} drawers")
+    print(f"  MemPalace Status — {seen} drawers")
     print(f"{'=' * 55}\n")
     for wing, rooms in sorted(wing_rooms.items()):
         print(f"  WING: {wing}")
