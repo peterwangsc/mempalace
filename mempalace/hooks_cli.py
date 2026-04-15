@@ -95,7 +95,20 @@ def _validate_transcript_path(transcript_path: str) -> Path:
 
 
 def _count_human_messages(transcript_path: str) -> int:
-    """Count human messages in a JSONL transcript, skipping command-messages."""
+    """Count user-initiated messages in a JSONL transcript.
+
+    Skips:
+      - <command-message> slash-command injections
+      - tool_result-only user lines (Claude Code represents tool output
+        as role=user with content=[{type:"tool_result"...}]; these are
+        assistant-initiated tool calls, not real user input)
+
+    The counter drives SAVE_INTERVAL — so "message" must mean "the user
+    typed at Claude," not "a user-role line appeared in the transcript."
+    Tool-heavy turns previously inflated this count 10–20x and caused
+    saves to fire ~every 1-2 real user turns in investigation-heavy
+    sessions.
+    """
     path = _validate_transcript_path(transcript_path)
     if path is None:
         if transcript_path:
@@ -116,6 +129,14 @@ def _count_human_messages(transcript_path: str) -> int:
                             if "<command-message>" in content:
                                 continue
                         elif isinstance(content, list):
+                            # Tool-results-only lines aren't user input —
+                            # they're the transcript echo of an assistant
+                            # tool call. Skip entirely.
+                            if all(
+                                isinstance(b, dict) and b.get("type") == "tool_result"
+                                for b in content
+                            ):
+                                continue
                             text = " ".join(
                                 b.get("text", "") for b in content if isinstance(b, dict)
                             )
