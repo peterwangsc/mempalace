@@ -329,7 +329,14 @@ def _file_chunks_locked(collection, source_file, chunks, wing, room, agent, extr
             chunk_room = chunk.get("memory_type", room) if extract_mode == "general" else room
             if extract_mode == "general":
                 room_counts_delta[chunk_room] += 1
-            drawer_id = f"drawer_{wing}_{chunk_room}_{hashlib.sha256((source_file + str(chunk['chunk_index'])).encode()).hexdigest()[:24]}"
+            # Content-addressed drawer IDs: same content → same ID, so
+            # re-mining the same file produces idempotent upserts and
+            # cursor-based incremental ingest can append new chunks
+            # without touching old ones. The chunk_index is intentionally
+            # NOT in the hash — appending new exchanges to a Claude Code
+            # transcript shifts no prior chunk's content, so prior IDs
+            # remain stable across re-mines.
+            drawer_id = f"drawer_{wing}_{chunk_room}_{hashlib.sha256((source_file + chunk['content']).encode()).hexdigest()[:24]}"
             try:
                 collection.upsert(
                     documents=[chunk["content"]],
