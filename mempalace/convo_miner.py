@@ -488,6 +488,196 @@ def scan_convos(convo_dir: str) -> list:
 # =============================================================================
 
 
+def _normalize_tail(filepath: Path, cursor: int, tail_bytes: bytes) -> str:
+    """Normalize the tail bytes [cursor, safe_boundary) to transcript text.
+
+    Returns:
+        normalized transcript text, or
+        "_advance_only" sentinel meaning "no chunkable content but
+        cursor should still advance" (e.g. the synthetic input had no
+        new user marker), or
+        "" / None if normalization produced nothing usable.
+
+    Reconstructs the in-memory state the full normalizer would have if
+    it had read the whole file: the tool_use_map is rebuilt from prefix
+    assistant lines so tool_result blocks in the tail render with the
+    right tool name instead of "Unknown".
+    """
+    from .normalize import _try_claude_code_jsonl, _try_codex_jsonl, strip_noise
+
+    tail_text = tail_bytes.decode("utf-8", errors="replace")
+
+    # Codex format has no merging and no tool_use_map — normalize directly.
+    normalized = _try_codex_jsonl(tail_text)
+    if normalized is None:
+        # Claude Code: synthesize prefix assistant lines + tail so the
+        # normalizer rebuilds the tool_use_map from real prior context.
+        with open(filepath, "rb") as f:
+            prefix_bytes = f.read(cursor)
+        prefix_text = prefix_bytes.decode("utf-8", errors="replace")
+
+        prefix_assistant_lines = []
+        for line in prefix_text.split("\n"):
+            line_s = line.strip()
+            if not line_s:
+                continue
+            try:
+                e = json.loads(line_s)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(e, dict) and e.get("type") == "assistant":
+                prefix_assistant_lines.append(line_s)
+
+        synthetic = "\n".join(prefix_assistant_lines + [tail_text.strip()])
+        normalized = _try_claude_code_jsonl(synthetic)
+        if normalized:
+            # Strip everything before the first user-turn marker that
+            # came from the tail. If no user marker appears, the tail
+            # had no new user turn — return the advance-only sentinel.
+            first_user_marker = normalized.find("\n> ")
+            if first_user_marker >= 0:
+                normalized = normalized[first_user_marker + 1 :]
+            elif not normalized.lstrip().startswith(">"):
+                return "_advance_only"
+
+    if normalized:
+        normalized = strip_noise(normalized)
+    return normalized or ""
+
+
+def _mine_with_cursor(
+    collection, source_file: str, wing: str, agent: str, extract_mode: str
+) -> tuple:
+    """Cursor-aware mine for an append-only JSONL source.
+
+    Returns (drawers_added, room_counts_delta, status) where status is
+    one of:
+        "ok"       — cursor advanced, new drawers (possibly 0) appended
+        "fallback" — cursor path declined; caller should run the
+                     existing full-mine path
+        "skipped"  — already-current; no work needed
+    """
+    filepath = Path(source_file)
+    room_counts_delta: dict = defaultdict(int)
+
+    # Sniff the format. Decline if it doesn't look like a known
+    # append-only JSONL.
+    if not _is_cursor_eligible(filepath):
+        return 0, room_counts_delta, "fallback"
+
+    safe_offset = _find_safe_boundary(filepath)
+    if safe_offset <= 0:
+        # No safe boundary yet (e.g. brand-new file with no completed
+        # user turn). Fall through to full mine — it will produce a
+        # normal first ingest, after which the cursor takes over.
+        return 0, room_counts_delta, "fallback"
+
+    with mine_lock(source_file):
+        cursor = _read_cursor(collection, source_file)
+
+        # Cursor sanity checks. Anything weird → fall back to full mine.
+        try:
+            file_size = os.path.getsize(filepath)
+        except OSError:
+            return 0, room_counts_delta, "fallback"
+        if cursor < 0 or cursor > file_size:
+            return 0, room_counts_delta, "fallback"
+        # First-time mine for this file: defer to full mine so the
+        # entire transcript gets ingested in one pass. The full-mine
+        # path handles short transcripts and tool-loop-heavy sessions
+        # correctly. Cursor mode then takes over for subsequent
+        # incremental appends — the caller (mine_convos) writes the
+        # cursor after the full mine completes successfully.
+        if cursor == 0:
+            return 0, room_counts_delta, "fallback"
+        if cursor >= safe_offset:
+            return 0, room_counts_delta, "skipped"
+
+        # Read [cursor, safe_offset). Both are line-aligned by construction.
+        try:
+            with open(filepath, "rb") as f:
+                f.seek(cursor)
+                tail_bytes = f.read(safe_offset - cursor)
+        except OSError:
+            return 0, room_counts_delta, "fallback"
+
+        if not tail_bytes.strip():
+            _write_cursor(collection, source_file, wing, agent, safe_offset)
+            return 0, room_counts_delta, "ok"
+
+        try:
+            normalized = _normalize_tail(filepath, cursor, tail_bytes)
+        except Exception:
+            return 0, room_counts_delta, "fallback"
+        if normalized == "_advance_only":
+            _write_cursor(collection, source_file, wing, agent, safe_offset)
+            return 0, room_counts_delta, "ok"
+
+        if not normalized or len(normalized.strip()) < MIN_CHUNK_SIZE:
+            _write_cursor(collection, source_file, wing, agent, safe_offset)
+            return 0, room_counts_delta, "ok"
+
+        # Chunk + write. Reuses the same chunker the full path uses.
+        if extract_mode == "general":
+            from .general_extractor import extract_memories
+
+            chunks = extract_memories(normalized)
+            room = None
+        else:
+            chunks = chunk_exchanges(normalized)
+            room = detect_convo_room(normalized)
+
+        if not chunks:
+            _write_cursor(collection, source_file, wing, agent, safe_offset)
+            return 0, room_counts_delta, "ok"
+
+        # Append drawers WITHOUT purging — content-addressed IDs make
+        # this safe (re-runs upsert to the same ID; no duplicates).
+        drawers_added = 0
+        for chunk in chunks:
+            chunk_room = (
+                chunk.get("memory_type", room) if extract_mode == "general" else room
+            )
+            if extract_mode == "general":
+                room_counts_delta[chunk_room] += 1
+            drawer_id = (
+                f"drawer_{wing}_{chunk_room}_"
+                f"{hashlib.sha256((source_file + chunk['content']).encode()).hexdigest()[:24]}"
+            )
+            try:
+                collection.upsert(
+                    documents=[chunk["content"]],
+                    ids=[drawer_id],
+                    metadatas=[
+                        {
+                            "wing": wing,
+                            "room": chunk_room,
+                            "hall": _detect_hall_cached(chunk["content"]),
+                            "source_file": source_file,
+                            "chunk_index": chunk["chunk_index"],
+                            "added_by": agent,
+                            "filed_at": datetime.now().isoformat(),
+                            "ingest_mode": "convos",
+                            "extract_mode": extract_mode,
+                            "normalize_version": NORMALIZE_VERSION,
+                            "cursor_appended": True,
+                        }
+                    ],
+                )
+                drawers_added += 1
+            except Exception as e:
+                if "already exists" not in str(e).lower():
+                    # Hard write failure — bail without advancing cursor
+                    # so next run retries the same range.
+                    return drawers_added, room_counts_delta, "fallback"
+
+        # Cursor advances LAST. If anything above raised, we never reach
+        # here and the next run re-processes the same tail (idempotent
+        # via content-hash IDs).
+        _write_cursor(collection, source_file, wing, agent, safe_offset)
+        return drawers_added, room_counts_delta, "ok"
+
+
 def _file_chunks_locked(collection, source_file, chunks, wing, room, agent, extract_mode):
     """Lock the source file, purge stale drawers, and upsert fresh chunks.
 
