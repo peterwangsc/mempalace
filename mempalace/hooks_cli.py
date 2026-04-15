@@ -43,6 +43,27 @@ def _sanitize_session_id(session_id: str) -> str:
     return sanitized or "unknown"
 
 
+def _validate_transcript_path(transcript_path: str):
+    """Resolve and validate a transcript path; return Path or None.
+
+    Required for _maybe_auto_ingest's cursor mining: we must reject
+    anything that doesn't look like a transcript before spawning a
+    mine subprocess on its parent directory.
+
+    Accepts:
+      - .jsonl or .json extension only
+      - no '..' traversal components in the original input
+    """
+    if not transcript_path:
+        return None
+    path = Path(transcript_path).expanduser().resolve()
+    if path.suffix not in (".jsonl", ".json"):
+        return None
+    if ".." in Path(transcript_path).parts:
+        return None
+    return path
+
+
 def _count_human_messages(transcript_path: str) -> int:
     """Count human messages in a JSONL transcript, skipping command-messages."""
     path = Path(transcript_path).expanduser()
@@ -99,20 +120,62 @@ def _output(data: dict):
     print(json.dumps(data, indent=2, ensure_ascii=False))
 
 
-def _maybe_auto_ingest():
-    """If MEMPAL_DIR is set and exists, run mempalace mine in background."""
+def _maybe_auto_ingest(transcript_path: str = "", sync: bool = False):
+    """Auto-ingest the active transcript and/or a configured directory.
+
+    Two ingest sources, evaluated independently:
+      1. The active session transcript (if `transcript_path` is a valid
+         file). Uses `--mode convos --cursor` so only newly-appended
+         lines are processed — matches Claude Code / Codex CLI's
+         append-only JSONL semantics.
+      2. The MEMPAL_DIR env var (if set and points at a directory).
+         Runs the existing full mine on that directory. This preserves
+         the original behavior for users who configured it explicitly.
+
+    sync=False (default, used by stop hook): run in background via Popen.
+    sync=True (used by precompact hook): block until done so memories
+        land before context compaction destroys them.
+    """
+    try:
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        pass
+    log_path = STATE_DIR / "hook.log"
+
+    def _run(cmd):
+        try:
+            with open(log_path, "a") as log_f:
+                if sync:
+                    subprocess.run(cmd, stdout=log_f, stderr=log_f, timeout=60)
+                else:
+                    subprocess.Popen(cmd, stdout=log_f, stderr=log_f)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+
+    # 1. Active transcript file → cursor-aware convo mine on its parent dir.
+    #    The cursor mine is correctness-safe for non-Claude-Code files
+    #    (it falls back internally), so passing the dir is fine even
+    #    when other JSONL files live alongside.
+    path = _validate_transcript_path(transcript_path)
+    if path is not None and path.is_file():
+        parent = str(path.parent)
+        _run(
+            [
+                sys.executable,
+                "-m",
+                "mempalace",
+                "mine",
+                parent,
+                "--mode",
+                "convos",
+                "--cursor",
+            ]
+        )
+
+    # 2. MEMPAL_DIR fallback (preserved for backwards compatibility).
     mempal_dir = os.environ.get("MEMPAL_DIR", "")
     if mempal_dir and os.path.isdir(mempal_dir):
-        try:
-            log_path = STATE_DIR / "hook.log"
-            with open(log_path, "a") as log_f:
-                subprocess.Popen(
-                    [sys.executable, "-m", "mempalace", "mine", mempal_dir],
-                    stdout=log_f,
-                    stderr=log_f,
-                )
-        except OSError:
-            pass
+        _run([sys.executable, "-m", "mempalace", "mine", mempal_dir])
 
 
 SUPPORTED_HARNESSES = {"claude-code", "codex"}
@@ -168,8 +231,10 @@ def hook_stop(data: dict, harness: str):
 
         _log(f"TRIGGERING SAVE at exchange {exchange_count}")
 
-        # Optional: auto-ingest if MEMPAL_DIR is set
-        _maybe_auto_ingest()
+        # Auto-ingest: cursor-mine the active transcript (background)
+        # plus the MEMPAL_DIR fallback if configured. Hook never blocks
+        # on this.
+        _maybe_auto_ingest(transcript_path=transcript_path, sync=False)
 
         _output({"decision": "block", "reason": STOP_BLOCK_REASON})
     else:
@@ -194,23 +259,14 @@ def hook_precompact(data: dict, harness: str):
     """Precompact hook: always block with comprehensive save instruction."""
     parsed = _parse_harness_input(data, harness)
     session_id = parsed["session_id"]
+    transcript_path = parsed["transcript_path"]
 
     _log(f"PRE-COMPACT triggered for session {session_id}")
 
-    # Optional: auto-ingest synchronously before compaction (so memories land first)
-    mempal_dir = os.environ.get("MEMPAL_DIR", "")
-    if mempal_dir and os.path.isdir(mempal_dir):
-        try:
-            log_path = STATE_DIR / "hook.log"
-            with open(log_path, "a") as log_f:
-                subprocess.run(
-                    [sys.executable, "-m", "mempalace", "mine", mempal_dir],
-                    stdout=log_f,
-                    stderr=log_f,
-                    timeout=60,
-                )
-        except OSError:
-            pass
+    # Auto-ingest synchronously before compaction (so memories land
+    # first). Cursor-mines the active transcript and, if MEMPAL_DIR is
+    # set, runs the full mine on that directory too.
+    _maybe_auto_ingest(transcript_path=transcript_path, sync=True)
 
     # Always block -- compaction = save everything
     _output({"decision": "block", "reason": PRECOMPACT_BLOCK_REASON})
