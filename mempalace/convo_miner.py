@@ -1008,6 +1008,38 @@ def _report_dry_run_chunks(filepath: Path, chunks: list, room, extract_mode: str
         room_counts[room] += 1
 
 
+def _sanitize_wing_name(name: str) -> str:
+    """Normalize a directory name into a wing identifier."""
+    return name.lower().replace(" ", "_").replace("-", "_")
+
+
+def _derive_wing_for_file(filepath: Path, convo_path: Path, override: str) -> str:
+    """Return the wing name for a convo file mined under convo_path.
+
+    If --wing was explicitly passed, `override` wins for every file (caller
+    wants a single wing). Otherwise: if the file lives in a subdirectory
+    of convo_path, the wing comes from that subdirectory's name; if the
+    file is directly in convo_path, the wing comes from convo_path's
+    name (the original behavior).
+
+    Rationale: `mempalace mine ~/.claude/projects --mode convos` should
+    produce one wing per project slug, not dump every transcript from
+    27 projects into a single "projects" wing. But `mempalace mine
+    ~/.claude/projects/-Users-peterwang-code-trainsim --mode convos`
+    (direct-child case) must keep producing a single trainsim wing.
+    """
+    if override:
+        return override
+    try:
+        rel = filepath.relative_to(convo_path)
+    except ValueError:
+        # File isn't under convo_path (shouldn't happen in practice).
+        return _sanitize_wing_name(convo_path.name)
+    parts = rel.parts
+    top = parts[0] if len(parts) > 1 else convo_path.name
+    return _sanitize_wing_name(top)
+
+
 def mine_convos(
     convo_dir: str,
     palace_path: str,
@@ -1036,22 +1068,30 @@ def mine_convos(
                            for any source that isn't recognized as
                            append-stable, so it's safe to enable
                            globally.
+
+    wing:
+        None (default) — derive per-file: direct children of `convo_dir`
+                          use convo_dir's name; files in subdirectories
+                          use the subdirectory's name. Lets you pass a
+                          root like ~/.claude/projects and get one wing
+                          per project slug automatically.
+        Explicit value — all files use this wing (single-wing mode,
+                          matches legacy behavior).
     """
 
     convo_path = Path(convo_dir).expanduser().resolve()
-    if not wing:
-        from .config import normalize_wing_name
-
-        wing = normalize_wing_name(convo_path.name)
+    wing_override = wing  # None = derive per-file; truthy = force for all files
 
     files = scan_convos(convo_dir)
     if limit > 0:
         files = files[:limit]
 
+    wing_display = wing_override if wing_override else "(per-subdirectory)"
+
     print(f"\n{'=' * 55}")
     print("  MemPalace Mine — Conversations")
     print(f"{'=' * 55}")
-    print(f"  Wing:    {wing}")
+    print(f"  Wing:    {wing_display}")
     print(f"  Source:  {convo_path}")
     print(f"  Files:   {len(files)}")
     print(f"  Palace:  {palace_path}")
@@ -1083,6 +1123,7 @@ def mine_convos(
 
     for i, filepath in enumerate(files, 1):
         source_file = str(filepath)
+        wing = _derive_wing_for_file(filepath, convo_path, wing_override)
 
         # Cursor-aware path for append-only JSONL sources (Claude Code,
         # Codex CLI). Dry-run is excluded so it never touches the
