@@ -336,7 +336,12 @@ def _file_chunks_locked(collection, source_file, chunks, wing, room, agent, extr
         # Batch chunks into bounded upserts so large transcripts keep most of
         # the embedding speedup without one huge Chroma/SQLite request. Keep
         # one filed_at per source file so all transcript drawers share an
-        # ingest timestamp.
+        # ingest timestamp. Drawer IDs are content-addressed (chunk content
+        # hashed, NOT chunk_index) so re-mining the same file produces
+        # idempotent upserts and cursor-based incremental ingest can append
+        # new chunks without touching old ones — appending new exchanges to
+        # a Claude Code transcript shifts no prior chunk's content, so prior
+        # IDs remain stable across re-mines.
         filed_at = datetime.now().isoformat()
         for batch_start in range(0, len(chunks), DRAWER_UPSERT_BATCH_SIZE):
             batch_docs: list = []
@@ -346,7 +351,7 @@ def _file_chunks_locked(collection, source_file, chunks, wing, room, agent, extr
                 chunk_room = chunk.get("memory_type", room) if extract_mode == "general" else room
                 if extract_mode == "general":
                     room_counts_delta[chunk_room] += 1
-                drawer_id = f"drawer_{wing}_{chunk_room}_{hashlib.sha256((source_file + str(chunk['chunk_index'])).encode()).hexdigest()[:24]}"
+                drawer_id = f"drawer_{wing}_{chunk_room}_{hashlib.sha256((source_file + chunk['content']).encode()).hexdigest()[:24]}"
                 batch_docs.append(chunk["content"])
                 batch_ids.append(drawer_id)
                 batch_metas.append(

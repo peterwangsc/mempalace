@@ -47,7 +47,11 @@ _DEFAULT_BACKEND = ChromaBackend()
 #
 # v2 (2026-04): introduced strip_noise() for Claude Code JSONL; previous
 #               drawers stored system tags / hook chrome verbatim.
-NORMALIZE_VERSION = 2
+# v3 (personal-v2 branch): drawer IDs are content-addressed
+#               (sha256(source_file + chunk_content)), enabling idempotent
+#               re-mines and cursor-based incremental ingest for append-only
+#               sources (Claude Code JSONL, Codex CLI JSONL).
+NORMALIZE_VERSION = 3
 
 
 def get_collection(
