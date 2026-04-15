@@ -82,6 +82,7 @@ def cmd_mine(args):
             limit=args.limit,
             dry_run=args.dry_run,
             extract_mode=args.extract,
+            cursor=getattr(args, "cursor", False),
         )
     else:
         from .miner import mine
@@ -480,6 +481,16 @@ def main():
         choices=["exchange", "general"],
         default="exchange",
         help="Extraction strategy for convos mode: 'exchange' (default) or 'general' (5 memory types)",
+    )
+    p_mine.add_argument(
+        "--cursor",
+        action="store_true",
+        help=(
+            "convos mode only: for append-only JSONL sources (Claude "
+            "Code, Codex CLI), seek past the stored byte cursor and "
+            "only mine new content. Falls back to full mine for other "
+            "formats."
+        ),
     )
 
     # search
