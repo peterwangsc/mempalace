@@ -195,6 +195,17 @@ def _parse_harness_input(data: dict, harness: str) -> dict:
 
 def hook_stop(data: dict, harness: str):
     """Stop hook: block every N messages for auto-save."""
+    # Subagent stops fire the same Stop hook against the parent session's
+    # transcript_path, so a single main-agent turn with N background
+    # subagents produces N+1 firings at identical timestamps. That's
+    # wasted CPU (mine_lock serializes them into identical work) and
+    # noisy logs. Skip subagent stops — their content is already in the
+    # parent transcript and gets ingested by the cursor mine when the
+    # main agent stops.
+    if data.get("agent_id"):
+        _output({})
+        return
+
     parsed = _parse_harness_input(data, harness)
     session_id = parsed["session_id"]
     stop_hook_active = parsed["stop_hook_active"]
