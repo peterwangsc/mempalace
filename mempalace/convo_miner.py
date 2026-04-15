@@ -10,6 +10,7 @@ Same palace as project mining. Different ingest strategy.
 
 import os
 import sys
+import json
 import hashlib
 from pathlib import Path
 from datetime import datetime
@@ -89,6 +90,194 @@ def _register_file(collection, source_file: str, wing: str, agent: str):
             }
         ],
     )
+
+
+# =============================================================================
+# CURSOR PRIMITIVES — append-only ingest for Claude Code / Codex JSONL
+# =============================================================================
+#
+# Claude Code and Codex CLI write JSONL transcripts that are *strictly
+# append-only* (verified at the source — fsAppendFile only, no in-place
+# mutation, even under tool-use, sub-agents, and compaction). We exploit
+# this to skip re-embedding the entire file every time the save hook
+# fires; only the byte tail past a stored cursor is processed.
+#
+# Two correctness traps:
+#   1. normalize._try_claude_code_jsonl merges consecutive assistant
+#      messages and merges tool-result-only user messages into the
+#      preceding assistant message. So a naive byte cursor would diverge
+#      from full re-normalization at the trailing message. The cursor
+#      stops at a *safe boundary* — the byte offset just past the last
+#      JSONL line that won't be merged into by future appended lines.
+#   2. Crash safety: the cursor is written LAST in the mine flow, after
+#      all drawers commit. If we crash before the cursor write, the next
+#      run reprocesses the same range; content-addressed drawer IDs make
+#      the upserts idempotent (no duplicates, no missing data).
+
+# Formats whose JSONL is append-stable AND whose normalizer can be
+# safely resumed from a byte cursor.
+_CURSOR_ELIGIBLE_SUFFIXES = {".jsonl"}
+
+
+def _is_cursor_eligible(filepath: Path) -> bool:
+    """Cheap pre-check: does this file look like Claude Code or Codex JSONL?
+
+    We sniff a few lines to confirm the format rather than trusting the
+    extension alone — a `.jsonl` file could be anything. Conservative:
+    any parse failure or unrecognized shape returns False, falling
+    through to the existing full-mine path.
+    """
+    if filepath.suffix.lower() not in _CURSOR_ELIGIBLE_SUFFIXES:
+        return False
+    try:
+        with open(filepath, "r", encoding="utf-8", errors="replace") as f:
+            for _ in range(20):
+                line = f.readline()
+                if not line:
+                    break
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                except json.JSONDecodeError:
+                    return False
+                if not isinstance(entry, dict):
+                    return False
+                # Claude Code: {"type": "user"|"assistant", "message": {...}}
+                if entry.get("type") in ("user", "human", "assistant") and isinstance(
+                    entry.get("message"), dict
+                ):
+                    return True
+                # Codex CLI: {"type": "session_meta"} or {"type": "event_msg", ...}
+                if entry.get("type") in ("session_meta", "event_msg"):
+                    return True
+    except OSError:
+        return False
+    return False
+
+
+def _find_safe_boundary(filepath: Path) -> int:
+    """Return the byte offset just after the last 'safe' JSONL line.
+
+    A safe line is one that, if more lines are appended, won't be merged
+    into by the normalizer. For Claude Code JSONL, that means a
+    user-role line whose content is NOT a list-of-tool-results-only —
+    because tool-result user lines and consecutive assistant lines both
+    merge upward into the prior assistant message. For Codex JSONL,
+    every event_msg is independent (no merging), so the last complete
+    line is safe.
+
+    Returns 0 if no safe boundary is found (cursor mode should not
+    advance). The returned offset always points at a newline boundary
+    in the file — partial trailing lines are never included.
+    """
+    safe_offset = 0
+    pos = 0
+    is_codex_format = False
+    try:
+        with open(filepath, "rb") as f:
+            for raw in f:
+                pos_after = pos + len(raw)
+                # Lines must end with \n to be considered complete; a
+                # trailing partial line (no newline) is in-flight and not safe.
+                if not raw.endswith(b"\n"):
+                    break
+                stripped = raw.strip()
+                if not stripped:
+                    pos = pos_after
+                    continue
+                try:
+                    entry = json.loads(stripped.decode("utf-8", errors="replace"))
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    pos = pos_after
+                    continue
+                if not isinstance(entry, dict):
+                    pos = pos_after
+                    continue
+
+                etype = entry.get("type", "")
+
+                # Codex format: every event_msg is an independent message;
+                # the boundary advances on every complete line.
+                if etype in ("session_meta", "event_msg"):
+                    is_codex_format = True
+                    safe_offset = pos_after
+                    pos = pos_after
+                    continue
+
+                # Claude Code format: only advance on a user message that
+                # is NOT tool-results-only.
+                if etype in ("user", "human"):
+                    msg = entry.get("message", {})
+                    if isinstance(msg, dict):
+                        content = msg.get("content", "")
+                        is_tool_only = isinstance(content, list) and all(
+                            isinstance(b, dict) and b.get("type") == "tool_result"
+                            for b in content
+                        )
+                        if not is_tool_only:
+                            safe_offset = pos_after
+                pos = pos_after
+    except OSError:
+        return 0
+
+    # Defensive: if neither format was recognized, decline to advance.
+    if safe_offset == 0 and not is_codex_format:
+        return 0
+    return safe_offset
+
+
+def _read_cursor(collection, source_file: str) -> int:
+    """Read the stored byte cursor for source_file. Returns 0 if absent.
+
+    Cursor lives on the same `_reg_<sha>` sentinel record that already
+    tracks file_already_mined() state. Any read error returns 0
+    (full mine).
+    """
+    try:
+        sentinel_id = f"_reg_{hashlib.sha256(source_file.encode()).hexdigest()[:24]}"
+        result = collection.get(ids=[sentinel_id])
+        metas = result.get("metadatas") or []
+        if not metas:
+            return 0
+        cursor = metas[0].get("byte_cursor", 0)
+        if not isinstance(cursor, (int, float)):
+            return 0
+        return int(cursor)
+    except Exception:
+        return 0
+
+
+def _write_cursor(
+    collection, source_file: str, wing: str, agent: str, byte_offset: int
+) -> None:
+    """Write the byte cursor to the sentinel. Called LAST in the mine flow.
+
+    Crash before this point → next run re-mines the same range →
+    content-hash drawer IDs make the upserts idempotent → no data loss.
+    """
+    sentinel_id = f"_reg_{hashlib.sha256(source_file.encode()).hexdigest()[:24]}"
+    try:
+        collection.upsert(
+            documents=[f"[registry] {source_file}"],
+            ids=[sentinel_id],
+            metadatas=[
+                {
+                    "wing": wing,
+                    "room": "_registry",
+                    "source_file": source_file,
+                    "added_by": agent,
+                    "filed_at": datetime.now().isoformat(),
+                    "ingest_mode": "registry",
+                    "normalize_version": NORMALIZE_VERSION,
+                    "byte_cursor": int(byte_offset),
+                }
+            ],
+        )
+    except Exception:
+        # Sentinel write failure is non-fatal — drawers are committed.
+        pass
 
 
 # =============================================================================
