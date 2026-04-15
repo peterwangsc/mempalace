@@ -463,6 +463,7 @@ def test_cmd_mine_convos_mode(mock_config_cls):
         no_gitignore=False,
         include_ignored=[],
         extract="general",
+        cursor=False,
     )
     with patch("mempalace.convo_miner.mine_convos") as mock_mine:
         cmd_mine(args)
@@ -474,6 +475,7 @@ def test_cmd_mine_convos_mode(mock_config_cls):
             limit=10,
             dry_run=True,
             extract_mode="general",
+            cursor=False,
         )
 
 

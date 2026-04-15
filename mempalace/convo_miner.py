@@ -213,8 +213,7 @@ def _find_safe_boundary(filepath: Path) -> int:
                     if isinstance(msg, dict):
                         content = msg.get("content", "")
                         is_tool_only = isinstance(content, list) and all(
-                            isinstance(b, dict) and b.get("type") == "tool_result"
-                            for b in content
+                            isinstance(b, dict) and b.get("type") == "tool_result" for b in content
                         )
                         if not is_tool_only:
                             safe_offset = pos_after
@@ -249,9 +248,7 @@ def _read_cursor(collection, source_file: str) -> int:
         return 0
 
 
-def _write_cursor(
-    collection, source_file: str, wing: str, agent: str, byte_offset: int
-) -> None:
+def _write_cursor(collection, source_file: str, wing: str, agent: str, byte_offset: int) -> None:
     """Write the byte cursor to the sentinel. Called LAST in the mine flow.
 
     Crash before this point → next run re-mines the same range →
@@ -643,9 +640,7 @@ def _mine_with_cursor(
         # this safe (re-runs upsert to the same ID; no duplicates).
         drawers_added = 0
         for chunk in chunks:
-            chunk_room = (
-                chunk.get("memory_type", room) if extract_mode == "general" else room
-            )
+            chunk_room = chunk.get("memory_type", room) if extract_mode == "general" else room
             if extract_mode == "general":
                 room_counts_delta[chunk_room] += 1
             drawer_id = (
@@ -760,6 +755,85 @@ def _file_chunks_locked(collection, source_file, chunks, wing, room, agent, extr
     return drawers_added, room_counts_delta, False
 
 
+def _try_cursor_path(
+    collection, source_file: str, wing: str, agent: str, extract_mode: str
+) -> tuple:
+    """Attempt the cursor-aware mine path; absorb any unexpected failure.
+
+    Returns (drawers_added, room_counts_delta, status) — same contract
+    as _mine_with_cursor, except an exception from the inner call is
+    caught and converted to status="fallback" so the main loop can drop
+    into the full-mine path. Defensive on purpose: any bug in cursor
+    logic must NEVER prevent the user's content from getting mined.
+    """
+    try:
+        return _mine_with_cursor(collection, source_file, wing, agent, extract_mode)
+    except Exception:
+        return 0, defaultdict(int), "fallback"
+
+
+def _consume_cursor_result(
+    drawers_added: int,
+    room_delta: dict,
+    status: str,
+    filepath: Path,
+    i: int,
+    total_files: int,
+    room_counts: dict,
+) -> tuple:
+    """Apply a cursor-path result to the running counters.
+
+    Returns (handled, total_drawers_delta, files_skipped_delta) where
+    handled=True means the caller should `continue` (cursor handled
+    this file); handled=False means fall through to the full-mine path.
+    """
+    if status == "skipped":
+        return True, 0, 1
+    if status == "ok":
+        for r, n in room_delta.items():
+            room_counts[r] += n
+        if drawers_added:
+            print(f"  ✓ [{i:4}/{total_files}] {filepath.name[:50]:50} +{drawers_added} (cursor)")
+        return True, drawers_added, 0
+    return False, 0, 0
+
+
+def _init_cursor_after_full_mine(
+    collection, filepath: Path, source_file: str, wing: str, agent: str
+) -> None:
+    """Best-effort cursor initialization after a successful full mine.
+
+    Called from mine_convos when cursor mode is enabled and the file is
+    cursor-eligible, so subsequent mines can resume incrementally
+    instead of re-processing the whole file. Failure here just leaves
+    the cursor unset — the next mine falls through to full mine again
+    (correct, just slower).
+    """
+    if not _is_cursor_eligible(filepath):
+        return
+    try:
+        boundary = _find_safe_boundary(filepath)
+        if boundary > 0:
+            _write_cursor(collection, source_file, wing, agent, boundary)
+    except Exception:
+        pass
+
+
+def _report_dry_run_chunks(filepath: Path, chunks: list, room, extract_mode: str, room_counts):
+    """Print + tally the dry-run chunk preview for one file. Mutates room_counts."""
+    if extract_mode == "general":
+        from collections import Counter
+
+        type_counts = Counter(c.get("memory_type", "general") for c in chunks)
+        types_str = ", ".join(f"{t}:{n}" for t, n in type_counts.most_common())
+        print(f"    [DRY RUN] {filepath.name} → {len(chunks)} memories ({types_str})")
+        for c in chunks:
+            room_counts[c.get("memory_type", "general")] += 1
+    else:
+        print(f"    [DRY RUN] {filepath.name} → room:{room} ({len(chunks)} drawers)")
+        room_counts[room] += 1
+
+
 def mine_convos(
     convo_dir: str,
     palace_path: str,
@@ -768,12 +842,25 @@ def mine_convos(
     limit: int = 0,
     dry_run: bool = False,
     extract_mode: str = "exchange",
+    cursor: bool = False,
 ):
     """Mine a directory of conversation files into the palace.
 
     extract_mode:
         "exchange" — default exchange-pair chunking (Q+A = one unit)
         "general"  — general extractor: decisions, preferences, milestones, problems, emotions
+
+    cursor:
+        False (default) — current behavior: file_already_mined() gates
+                           re-mining on the assumption transcripts are
+                           immutable.
+        True            — for append-only sources (Claude Code JSONL,
+                           Codex CLI JSONL), seek past a stored byte
+                           cursor and only process newly-appended
+                           content. Falls back to the full-mine path
+                           for any source that isn't recognized as
+                           append-stable, so it's safe to enable
+                           globally.
     """
 
     convo_path = Path(convo_dir).expanduser().resolve()
@@ -805,6 +892,22 @@ def mine_convos(
 
     for i, filepath in enumerate(files, 1):
         source_file = str(filepath)
+
+        # Cursor-aware path for append-only JSONL sources (Claude Code,
+        # Codex CLI). Dry-run is excluded so it never touches the
+        # sentinel record. Any "fallback" status drops through to the
+        # existing full-mine path.
+        if cursor and not dry_run:
+            drawers_added, room_delta, status = _try_cursor_path(
+                collection, source_file, wing, agent, extract_mode
+            )
+            handled, d_delta, s_delta = _consume_cursor_result(
+                drawers_added, room_delta, status, filepath, i, len(files), room_counts
+            )
+            total_drawers += d_delta
+            files_skipped += s_delta
+            if handled:
+                continue
 
         # Skip if already filed
         if not dry_run and file_already_mined(collection, source_file):
@@ -845,21 +948,8 @@ def mine_convos(
             room = None  # set per-chunk below
 
         if dry_run:
-            if extract_mode == "general":
-                from collections import Counter
-
-                type_counts = Counter(c.get("memory_type", "general") for c in chunks)
-                types_str = ", ".join(f"{t}:{n}" for t, n in type_counts.most_common())
-                print(f"    [DRY RUN] {filepath.name} → {len(chunks)} memories ({types_str})")
-            else:
-                print(f"    [DRY RUN] {filepath.name} → room:{room} ({len(chunks)} drawers)")
+            _report_dry_run_chunks(filepath, chunks, room, extract_mode, room_counts)
             total_drawers += len(chunks)
-            # Track room counts
-            if extract_mode == "general":
-                for c in chunks:
-                    room_counts[c.get("memory_type", "general")] += 1
-            else:
-                room_counts[room] += 1
             continue
 
         if extract_mode != "general":
@@ -878,6 +968,13 @@ def mine_convos(
 
         total_drawers += drawers_added
         print(f"  + [{i:4}/{len(files)}] {filepath.name[:50]:50} +{drawers_added}")
+
+        # If cursor mode is enabled and this is a cursor-eligible source,
+        # initialize the byte_cursor to the file's current safe boundary
+        # so subsequent mines can resume incrementally instead of
+        # re-processing the whole file.
+        if cursor:
+            _init_cursor_after_full_mine(collection, filepath, source_file, wing, agent)
 
     print(f"\n{'=' * 55}")
     print("  Done.")
