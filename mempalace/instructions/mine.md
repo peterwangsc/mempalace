@@ -26,11 +26,28 @@ Mines code files, documentation, and notes from a project directory.
 
 Mines conversation exports from Claude, ChatGPT, or Slack into the palace.
 
+#### Incremental mining for append-only JSONL (Claude Code, Codex CLI)
+
+For `~/.claude/projects/` or `~/.codex/sessions/`, add `--cursor`:
+
+    mempalace mine <dir> --mode convos --cursor
+
+Claude Code and Codex CLI JSONL transcripts are strictly append-only,
+so cursor mode seeks past a stored byte cursor and only processes
+newly-appended content. Subsequent mines (on the next hook fire or
+manual re-run) skip already-ingested bytes — no re-embedding.
+
+Always safe to include: for any source that isn't recognized as
+append-stable (markdown, ChatGPT exports, Slack), cursor mode
+silently falls back to the full-mine path. Recommended for any
+ongoing `mempalace mine` call against live transcript directories.
+
 ### General extraction (auto-classify)
 
     mempalace mine <dir> --mode convos --extract general
 
 Auto-classifies mined content into decisions, milestones, and problems.
+Combine with `--cursor` for incremental general-extraction mining.
 
 ## 3. Optionally split mega-files first
 
