@@ -930,6 +930,172 @@ def cmd_compress(args):
         print("  (dry run -- nothing stored)")
 
 
+def cmd_closets_backfill(args):
+    """Backfill regex closets from existing drawers — no re-mine needed.
+
+    Convo mining historically skipped closet building (oversight, not
+    intentional — see companion commit). For palaces built solely from
+    convo mining (e.g. via the Stop / PreCompact / SessionEnd hooks),
+    the `mempalace_closets` collection ends up empty and
+    `searcher.py`'s closet rank-boost (0.40/0.25/0.15/...) is dead
+    code. This command walks `mempalace_drawers`, groups by
+    `source_file`, and rebuilds closet lines with the same regex
+    extractor the miner already uses. No source files are re-read; no
+    drawers are re-embedded.
+    """
+    import hashlib
+    from collections import Counter, defaultdict
+    from datetime import datetime
+
+    from .palace import (
+        NORMALIZE_VERSION,
+        build_closet_lines,
+        get_closets_collection,
+        get_collection,
+        mine_lock,
+        purge_file_closets,
+        upsert_closet_lines,
+    )
+
+    palace_path = os.path.expanduser(args.palace) if args.palace else MempalaceConfig().palace_path
+
+    try:
+        drawers_col = get_collection(palace_path, create=False)
+    except Exception:
+        print(f"\n  No palace found at {palace_path}")
+        print("  Run: mempalace init <dir> then mempalace mine <dir>")
+        sys.exit(1)
+    if drawers_col is None:
+        print(f"\n  No drawers collection at {palace_path}")
+        sys.exit(1)
+
+    closets_col = None if args.dry_run else get_closets_collection(palace_path)
+
+    # Pull all drawers (batched to dodge SQLite parameter limits, mirroring cmd_compress).
+    _BATCH = 500
+    by_source = defaultdict(lambda: {"ids": [], "docs": [], "metas": []})
+    offset = 0
+    where = {"wing": args.wing} if args.wing else None
+    total_seen = 0
+    while True:
+        try:
+            kwargs = {
+                "include": ["documents", "metadatas"],
+                "limit": _BATCH,
+                "offset": offset,
+            }
+            if where:
+                kwargs["where"] = where
+            batch = drawers_col.get(**kwargs)
+        except Exception as e:
+            print(f"\n  Error reading drawers at offset {offset}: {e}")
+            sys.exit(1)
+        ids = batch.get("ids", []) or []
+        docs = batch.get("documents", []) or []
+        metas = batch.get("metadatas", []) or []
+        if not ids:
+            break
+        for did, doc, meta in zip(ids, docs, metas):
+            if not isinstance(meta, dict):
+                continue
+            source = meta.get("source_file")
+            if not source:
+                continue
+            bucket = by_source[source]
+            bucket["ids"].append(did)
+            bucket["docs"].append(doc)
+            bucket["metas"].append(meta)
+            total_seen += 1
+        offset += len(ids)
+        if len(ids) < _BATCH:
+            break
+
+    if not by_source:
+        wing_label = f" in wing '{args.wing}'" if args.wing else ""
+        print(f"\n  No drawers found{wing_label}.")
+        return
+
+    print(f"\n{'=' * 55}")
+    print("  MemPalace Closet Backfill")
+    print(f"{'=' * 55}")
+    print(f"  Palace:  {palace_path}")
+    print(f"  Wing:    {args.wing or '(all wings)'}")
+    print(f"  Sources: {len(by_source)}")
+    print(f"  Drawers: {total_seen}")
+    if args.dry_run:
+        print("  DRY RUN — nothing will be written")
+    print(f"{'-' * 55}\n")
+
+    sources = list(by_source.keys())
+    if args.limit > 0:
+        sources = sources[: args.limit]
+
+    written = 0
+    skipped = 0
+    failed = 0
+    for i, source in enumerate(sources, 1):
+        bucket = by_source[source]
+        metas = bucket["metas"]
+        wing_counter = Counter(m.get("wing", "") for m in metas if m.get("wing"))
+        room_counter = Counter(m.get("room", "general") for m in metas if m.get("room"))
+        if not wing_counter:
+            skipped += 1
+            continue
+        wing = wing_counter.most_common(1)[0][0]
+        room = room_counter.most_common(1)[0][0] if room_counter else "general"
+        try:
+            lines = build_closet_lines(
+                source, bucket["ids"], "\n\n".join(bucket["docs"]), wing, room
+            )
+        except Exception:
+            failed += 1
+            continue
+        if not lines:
+            skipped += 1
+            continue
+
+        label = os.path.basename(source) or source
+        print(
+            f"  [{i:4}/{len(sources)}] {label[:50]:50} "
+            f"{len(lines)} lines / {len(bucket['ids'])} drawers"
+        )
+
+        if args.dry_run:
+            continue
+
+        closet_id_base = (
+            f"closet_{wing}_{room}_{hashlib.sha256(source.encode()).hexdigest()[:24]}"
+        )
+        closet_meta = {
+            "wing": wing,
+            "room": room,
+            "source_file": source,
+            "drawer_count": len(bucket["ids"]),
+            "filed_at": datetime.now().isoformat(),
+            "normalize_version": NORMALIZE_VERSION,
+            "ingest_mode": "convos-backfill",
+            "added_by": "closets-backfill",
+        }
+        try:
+            with mine_lock(source):
+                purge_file_closets(closets_col, source)
+                upsert_closet_lines(closets_col, closet_id_base, lines, closet_meta)
+            written += 1
+        except Exception as e:
+            failed += 1
+            print(f"      ✗ {e}")
+
+    print(f"\n{'=' * 55}")
+    print("  Done.")
+    print(f"  Sources processed: {len(sources)}")
+    print(f"  Closets written:   {written}")
+    print(f"  Sources skipped:   {skipped}")
+    print(f"  Failures:          {failed}")
+    if args.dry_run:
+        print("  (dry run — nothing stored)")
+    print(f"{'=' * 55}\n")
+
+
 def main():
     version_label = f"MemPalace {__version__}"
     parser = argparse.ArgumentParser(
@@ -1261,6 +1427,24 @@ def main():
 
     sub.add_parser("status", help="Show what's been filed")
 
+    # closets — index-layer maintenance
+    p_closets = sub.add_parser(
+        "closets",
+        help="Closet index maintenance (backfill missing closets from existing drawers)",
+    )
+    closets_sub = p_closets.add_subparsers(dest="closets_action")
+    p_closets_backfill = closets_sub.add_parser(
+        "backfill",
+        help="Build regex closets for sources that have drawers but no closets",
+    )
+    p_closets_backfill.add_argument("--wing", default=None, help="Limit to one wing")
+    p_closets_backfill.add_argument(
+        "--limit", type=int, default=0, help="Max source_files to process (0 = all)"
+    )
+    p_closets_backfill.add_argument(
+        "--dry-run", action="store_true", help="Show what would be written without writing"
+    )
+
     args = parser.parse_args()
 
     if not args.command:
@@ -1282,6 +1466,14 @@ def main():
             return
         args.name = name
         cmd_instructions(args)
+        return
+
+    if args.command == "closets":
+        action = getattr(args, "closets_action", None)
+        if action == "backfill":
+            cmd_closets_backfill(args)
+            return
+        p_closets.print_help()
         return
 
     dispatch = {
