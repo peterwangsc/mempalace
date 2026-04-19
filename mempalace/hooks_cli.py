@@ -68,6 +68,10 @@ PRECOMPACT_BLOCK_REASON = (
     "Save everything to MemPalace, then allow compaction to proceed."
 )
 
+# SessionEnd timeout in Claude Code is hard-capped at 1500ms by default.
+# Anything heavier MUST be detached so it survives parent shutdown.
+SESSION_END_STUB_WING = "wing_session_stub"
+
 
 def _sanitize_session_id(session_id: str) -> str:
     """Only allow alnum, dash, underscore to prevent path traversal."""
@@ -525,6 +529,175 @@ def _ingest_transcript(transcript_path: str):
         pass
 
 
+def _spawn_detached_cursor_mine(transcript_path: str) -> None:
+    """Spawn `mempalace mine --cursor` in a detached session that
+    survives parent shutdown. SessionEnd's 1.5s budget is too small
+    to wait synchronously, and a normal Popen dies when Claude Code
+    teardown reaps its process group.
+    """
+    path = _validate_transcript_path(transcript_path)
+    if path is None or not path.is_file():
+        return
+    parent = str(path.parent)
+    log_path = STATE_DIR / "hook.log"
+    try:
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        with open(log_path, "a") as log_f:
+            subprocess.Popen(
+                [
+                    sys.executable,
+                    "-m",
+                    "mempalace",
+                    "mine",
+                    parent,
+                    "--mode",
+                    "convos",
+                    "--cursor",
+                ],
+                stdout=log_f,
+                stderr=log_f,
+                stdin=subprocess.DEVNULL,
+                start_new_session=True,
+                close_fds=True,
+            )
+    except OSError:
+        pass
+
+
+def _read_session_endpoints(transcript_path: str, max_chars: int = 400):
+    """Pull (first_user_msg, last_user_msg, real_user_turn_count) from a
+    Claude Code / Codex JSONL transcript. Bounded scan — must complete
+    well under the 1.5s SessionEnd budget even on multi-MB transcripts.
+
+    Skips command-injections (<command-message>) and tool_result-only
+    user lines, mirroring _count_human_messages's filtering.
+    """
+    path = Path(transcript_path).expanduser()
+    if not path.is_file():
+        return None, None, 0
+    first = None
+    last = None
+    count = 0
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                try:
+                    entry = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                msg = entry.get("message", {}) if isinstance(entry, dict) else {}
+                text = None
+                if isinstance(msg, dict) and msg.get("role") == "user":
+                    content = msg.get("content", "")
+                    if isinstance(content, str):
+                        if "<command-message>" in content:
+                            continue
+                        text = content
+                    elif isinstance(content, list):
+                        if all(
+                            isinstance(b, dict) and b.get("type") == "tool_result"
+                            for b in content
+                        ):
+                            continue
+                        joined = " ".join(
+                            b.get("text", "") for b in content if isinstance(b, dict)
+                        )
+                        if "<command-message>" in joined:
+                            continue
+                        text = joined
+                elif isinstance(entry, dict) and entry.get("type") == "event_msg":
+                    payload = entry.get("payload", {})
+                    if isinstance(payload, dict) and payload.get("type") == "user_message":
+                        m = payload.get("message", "")
+                        if isinstance(m, str) and "<command-message>" not in m:
+                            text = m
+                if text is None:
+                    continue
+                count += 1
+                snippet = text.strip()[:max_chars]
+                if first is None:
+                    first = snippet
+                last = snippet
+    except OSError:
+        return None, None, 0
+    return first, last, count
+
+
+def _write_session_end_stub(
+    session_id: str, transcript_path: str, reason: str, cwd: str
+) -> bool:
+    """Write a synthetic diary entry directly via the palace API — no MCP,
+    no AI cooperation needed. Returns True on success.
+
+    This is the load-bearing fix for the /clear data-loss case: even when
+    no AI ever responds to a Stop or PreCompact block instruction, this
+    stub guarantees the session leaves a discoverable marker behind.
+    """
+    try:
+        from .palace import get_collection
+        from .config import MempalaceConfig
+    except Exception:
+        return False
+
+    try:
+        palace_path = MempalaceConfig().palace_path
+    except Exception:
+        return False
+
+    try:
+        col = get_collection(palace_path, create=True)
+    except Exception:
+        return False
+    if col is None:
+        return False
+
+    first_msg, last_msg, turn_count = _read_session_endpoints(transcript_path)
+    now = datetime.now()
+    body_lines = [
+        f"AUTO-SESSION-END-STUB session={session_id} reason={reason}",
+        f"timestamp={now.isoformat()}",
+        f"cwd={cwd}",
+        f"transcript_path={transcript_path}",
+        f"real_user_turns={turn_count}",
+    ]
+    if first_msg:
+        body_lines.append(f"first_user_msg: {first_msg}")
+    if last_msg and last_msg != first_msg:
+        body_lines.append(f"last_user_msg: {last_msg}")
+    body_lines.append(
+        "NOTE: synthetic stub written by mempal-session-end-hook. "
+        "Drawers from the transcript are mined in a detached background "
+        "process. A richer AAAK summary may supersede this entry if an "
+        "agent later writes one for the same session."
+    )
+    body = "\n".join(body_lines)
+
+    entry_id = (
+        f"diary_{SESSION_END_STUB_WING}_{now.strftime('%Y%m%d_%H%M%S%f')}_"
+        f"{re.sub(r'[^a-zA-Z0-9]', '', session_id)[:16]}"
+    )
+    try:
+        col.upsert(
+            ids=[entry_id],
+            documents=[body],
+            metadatas=[
+                {
+                    "wing": SESSION_END_STUB_WING,
+                    "room": "diary",
+                    "hall": "hall_diary",
+                    "type": "session_end_stub",
+                    "reason": reason,
+                    "session_id": session_id,
+                    "filed_at": now.isoformat(),
+                    "date": now.strftime("%Y-%m-%d"),
+                }
+            ],
+        )
+        return True
+    except Exception:
+        return False
+
+
 SUPPORTED_HARNESSES = {"claude-code", "codex"}
 
 
@@ -724,6 +897,48 @@ def hook_precompact(data: dict, harness: str):
     # above via _ingest_transcript.
     _mine_sync()
 
+    # Stub-on-precompact: write a minimal SessionEnd-style stub so even
+    # if the user /clears immediately after /compact (skipping
+    # SessionEnd entirely on some harnesses), this session has at
+    # least one discoverable marker. The cursor-aware _ingest_transcript
+    # above already captured the verbatim tail; the stub is the
+    # narrative breadcrumb.
+    cwd = str(data.get("cwd", "") or "")
+    if _write_session_end_stub(session_id, transcript_path, "precompact", cwd):
+        _log(f"PRE-COMPACT stub written for session {session_id}")
+
+    _output({})
+
+
+def hook_session_end(data: dict, harness: str):
+    """SessionEnd hook: fires on /clear, /logout, prompt-input-exit, etc.
+
+    Hard 1.5s budget in Claude Code (overridable via
+    CLAUDE_CODE_SESSIONEND_HOOKS_TIMEOUT_MS). We do two cheap things:
+
+      1. Write a synthetic diary stub directly via the palace API —
+         pure Python, well under the budget. This is the bare-minimum
+         marker that survives /clear; without it, short sessions
+         disappear entirely from MemPalace.
+      2. Spawn the cursor mine in a *detached* process group so it
+         survives Claude Code's teardown reaping. The mine itself can
+         take seconds; it just runs after the session is gone.
+
+    SessionEnd never blocks — there's no AI left to respond.
+    """
+    parsed = _parse_harness_input(data, harness)
+    session_id = parsed["session_id"]
+    transcript_path = parsed["transcript_path"]
+    reason = str(data.get("reason", "") or "unknown")
+
+    _log(f"SESSION-END triggered for session {session_id} reason={reason}")
+
+    cwd = str(data.get("cwd", "") or "")
+    if _write_session_end_stub(session_id, transcript_path, reason, cwd):
+        _log(f"SESSION-END stub written for session {session_id}")
+
+    _spawn_detached_cursor_mine(transcript_path)
+
     _output({})
 
 
@@ -737,6 +952,7 @@ def run_hook(hook_name: str, harness: str):
 
     hooks = {
         "session-start": hook_session_start,
+        "session-end": hook_session_end,
         "stop": hook_stop,
         "precompact": hook_precompact,
     }

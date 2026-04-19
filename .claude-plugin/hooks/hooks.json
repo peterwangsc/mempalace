@@ -1,5 +1,5 @@
 {
-  "description": "MemPalace auto-save and pre-compact hooks",
+  "description": "MemPalace auto-save, pre-compact, and session-end hooks",
   "hooks": {
     "Stop": [
       {
@@ -17,6 +17,16 @@
           {
             "type": "command",
             "command": "bash ${CLAUDE_PLUGIN_ROOT}/hooks/mempal-precompact-hook.sh"
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash ${CLAUDE_PLUGIN_ROOT}/hooks/mempal-session-end-hook.sh"
           }
         ]
       }
