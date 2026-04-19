@@ -20,9 +20,13 @@ from .normalize import normalize
 from .palace import (
     NORMALIZE_VERSION,
     SKIP_DIRS,
+    build_closet_lines,
     file_already_mined,
+    get_closets_collection,
     get_collection,
     mine_lock,
+    purge_file_closets,
+    upsert_closet_lines,
 )
 
 
@@ -542,8 +546,86 @@ def _normalize_tail(filepath: Path, cursor: int, tail_bytes: bytes) -> str:
     return normalized or ""
 
 
+def _rebuild_closets_for_file(
+    drawers_col, closets_col, source_file: str, wing: str, room, agent: str
+) -> None:
+    """(Re)build the closet index lines for one source file from the
+    drawers currently stored for it. Mirrors miner.py:624-648 for the
+    convo path, which historically skipped closet building entirely.
+
+    Queries chroma for the canonical drawer set, derives closets from
+    joined content, then purge+upsert so a re-mine never leaves
+    orphaned closets behind. Safe to call after both the full-mine
+    path and the cursor-mine path: the cursor path appends new drawers
+    incrementally, and rebuilding closets from the union picks up the
+    new content automatically.
+
+    Failures are swallowed — closets are a search rank-boost, not the
+    source of truth. We never block drawer writes on closet trouble.
+    """
+    if drawers_col is None or closets_col is None:
+        return
+    try:
+        result = drawers_col.get(
+            where={"source_file": source_file},
+            include=["documents", "metadatas"],
+        )
+    except Exception:
+        return
+
+    drawer_ids = result.get("ids", []) or []
+    docs = result.get("documents", []) or []
+    metas = result.get("metadatas", []) or []
+    if not drawer_ids or not docs:
+        return
+
+    # Closet metadata wants a single representative room; general
+    # extract mode varies room per chunk, so pick the most common one
+    # observed in stored drawer metadata.
+    room_for_closet = room
+    if room_for_closet is None:
+        from collections import Counter
+
+        room_counter = Counter(m.get("room", "general") for m in metas if isinstance(m, dict))
+        room_for_closet = room_counter.most_common(1)[0][0] if room_counter else "general"
+
+    content = "\n\n".join(docs)
+    try:
+        lines = build_closet_lines(source_file, drawer_ids, content, wing, room_for_closet)
+    except Exception:
+        return
+    if not lines:
+        return
+
+    closet_id_base = (
+        f"closet_{wing}_{room_for_closet}_"
+        f"{hashlib.sha256(source_file.encode()).hexdigest()[:24]}"
+    )
+    closet_meta = {
+        "wing": wing,
+        "room": room_for_closet,
+        "source_file": source_file,
+        "drawer_count": len(drawer_ids),
+        "filed_at": datetime.now().isoformat(),
+        "normalize_version": NORMALIZE_VERSION,
+        "ingest_mode": "convos",
+        "added_by": agent,
+    }
+    try:
+        with mine_lock(source_file):
+            purge_file_closets(closets_col, source_file)
+            upsert_closet_lines(closets_col, closet_id_base, lines, closet_meta)
+    except Exception:
+        return
+
+
 def _mine_with_cursor(
-    collection, source_file: str, wing: str, agent: str, extract_mode: str
+    collection,
+    source_file: str,
+    wing: str,
+    agent: str,
+    extract_mode: str,
+    closets_col=None,
 ) -> tuple:
     """Cursor-aware mine for an append-only JSONL source.
 
@@ -670,10 +752,32 @@ def _mine_with_cursor(
         # here and the next run re-processes the same tail (idempotent
         # via content-hash IDs).
         _write_cursor(collection, source_file, wing, agent, safe_offset)
-        return drawers_added, room_counts_delta, "ok"
+
+    # Rebuild closets OUTSIDE mine_lock — _rebuild_closets_for_file
+    # acquires its own mine_lock for the purge+upsert, and re-entrant
+    # locking isn't guaranteed across backends.
+    if drawers_added > 0:
+        _rebuild_closets_for_file(
+            collection,
+            closets_col,
+            source_file,
+            wing,
+            room if extract_mode != "general" else None,
+            agent,
+        )
+    return drawers_added, room_counts_delta, "ok"
 
 
-def _file_chunks_locked(collection, source_file, chunks, wing, room, agent, extract_mode):
+def _file_chunks_locked(
+    collection,
+    source_file,
+    chunks,
+    wing,
+    room,
+    agent,
+    extract_mode,
+    closets_col=None,
+):
     """Lock the source file, purge stale drawers, and upsert fresh chunks.
 
     Combines the per-file serialization that prevents concurrent agents from
@@ -734,11 +838,28 @@ def _file_chunks_locked(collection, source_file, chunks, wing, room, agent, extr
             except Exception as e:
                 if "already exists" not in str(e).lower():
                     raise
+
+    # Build closets OUTSIDE mine_lock — _rebuild_closets_for_file
+    # acquires its own. Mirrors miner.py:624-648 for the convo path.
+    if drawers_added > 0:
+        _rebuild_closets_for_file(
+            collection,
+            closets_col,
+            source_file,
+            wing,
+            room if extract_mode != "general" else None,
+            agent,
+        )
     return drawers_added, room_counts_delta, False
 
 
 def _try_cursor_path(
-    collection, source_file: str, wing: str, agent: str, extract_mode: str
+    collection,
+    source_file: str,
+    wing: str,
+    agent: str,
+    extract_mode: str,
+    closets_col=None,
 ) -> tuple:
     """Attempt the cursor-aware mine path; absorb any unexpected failure.
 
@@ -749,7 +870,9 @@ def _try_cursor_path(
     logic must NEVER prevent the user's content from getting mined.
     """
     try:
-        return _mine_with_cursor(collection, source_file, wing, agent, extract_mode)
+        return _mine_with_cursor(
+            collection, source_file, wing, agent, extract_mode, closets_col=closets_col
+        )
     except Exception:
         return 0, defaultdict(int), "fallback"
 
@@ -907,6 +1030,7 @@ def mine_convos(
     print(f"{'-' * 55}\n")
 
     collection = get_collection(palace_path) if not dry_run else None
+    closets_col = get_closets_collection(palace_path) if not dry_run else None
 
     total_drawers = 0
     files_skipped = 0
@@ -922,7 +1046,7 @@ def mine_convos(
         # existing full-mine path.
         if cursor and not dry_run:
             drawers_added, room_delta, status = _try_cursor_path(
-                collection, source_file, wing, agent, extract_mode
+                collection, source_file, wing, agent, extract_mode, closets_col=closets_col
             )
             handled, d_delta, s_delta = _consume_cursor_result(
                 drawers_added, room_delta, status, filepath, i, len(files), room_counts
@@ -981,7 +1105,14 @@ def mine_convos(
         # Lock + purge stale + file fresh chunks. Lock serializes concurrent
         # agents; purge removes pre-v2 drawers so the schema bump applies.
         drawers_added, room_delta, skipped = _file_chunks_locked(
-            collection, source_file, chunks, wing, room, agent, extract_mode
+            collection,
+            source_file,
+            chunks,
+            wing,
+            room,
+            agent,
+            extract_mode,
+            closets_col=closets_col,
         )
         if skipped:
             files_skipped += 1
