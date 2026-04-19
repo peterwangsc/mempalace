@@ -83,6 +83,7 @@ def cmd_mine(args):
             dry_run=args.dry_run,
             extract_mode=args.extract,
             cursor=getattr(args, "cursor", False),
+            smart_closets=getattr(args, "smart_closets", False),
         )
     else:
         from .miner import mine
@@ -423,6 +424,53 @@ def cmd_compress(args):
         print("  (dry run -- nothing stored)")
 
 
+def _backfill_lines_for_source(
+    source, bucket, smart_ctx, build_closet_lines_fn
+):
+    """Build closet lines for one source. Returns (lines, wing, room, ingest_mode).
+    Extracted from cmd_closets_backfill to stay under ruff's C901 complexity
+    limit; no behavior change.
+    """
+    from collections import Counter
+
+    metas = bucket["metas"]
+    wing_counter = Counter(m.get("wing", "") for m in metas if m.get("wing"))
+    if not wing_counter:
+        return [], None, None, None
+    wing = wing_counter.most_common(1)[0][0]
+    room_counter = Counter(m.get("room", "general") for m in metas if m.get("room"))
+    room = room_counter.most_common(1)[0][0] if room_counter else "general"
+    content_joined = "\n\n".join(bucket["docs"])
+
+    lines = []
+    ingest_mode = "convos-backfill"
+    if smart_ctx:
+        from .smart_closets import build_smart_closet_lines
+
+        try:
+            lines = build_smart_closet_lines(
+                source,
+                bucket["ids"],
+                content_joined,
+                wing,
+                room,
+                idf_index=smart_ctx["idf_index"],
+                embedder=smart_ctx["embedder"],
+            )
+            if lines:
+                ingest_mode = "convos-backfill-smart"
+        except Exception:
+            lines = []
+    if not lines:
+        try:
+            lines = build_closet_lines_fn(
+                source, bucket["ids"], content_joined, wing, room
+            )
+        except Exception:
+            return [], wing, room, None
+    return lines, wing, room, ingest_mode
+
+
 def cmd_closets_backfill(args):
     """Backfill regex closets from existing drawers — no re-mine needed.
 
@@ -437,7 +485,7 @@ def cmd_closets_backfill(args):
     drawers are re-embedded.
     """
     import hashlib
-    from collections import Counter, defaultdict
+    from collections import defaultdict
     from datetime import datetime
 
     from .palace import (
@@ -463,6 +511,23 @@ def cmd_closets_backfill(args):
         sys.exit(1)
 
     closets_col = None if args.dry_run else get_closets_collection(palace_path)
+
+    # Smart closet context: built once (IDF index is corpus-wide) and
+    # reused per source. Only resolved if --smart was requested.
+    smart_ctx = None
+    if getattr(args, "smart", False):
+        from .smart_closets import _embedder_from_drawers_col, get_or_build_idf_index
+
+        embedder = _embedder_from_drawers_col(drawers_col)
+        if embedder is None:
+            print("  Smart backfill requested but embedder unavailable — using regex.")
+        else:
+            idf_index = get_or_build_idf_index(palace_path, drawers_col, progress=True)
+            smart_ctx = {"idf_index": idf_index, "embedder": embedder}
+            print(
+                f"  Smart closets: n_docs={idf_index['n_docs']}, "
+                f"ngrams={len(idf_index['idf'])}"
+            )
 
     # Pull all drawers (batched to dodge SQLite parameter limits, mirroring cmd_compress).
     _BATCH = 500
@@ -528,19 +593,13 @@ def cmd_closets_backfill(args):
     failed = 0
     for i, source in enumerate(sources, 1):
         bucket = by_source[source]
-        metas = bucket["metas"]
-        wing_counter = Counter(m.get("wing", "") for m in metas if m.get("wing"))
-        room_counter = Counter(m.get("room", "general") for m in metas if m.get("room"))
-        if not wing_counter:
+        lines, wing, room, ingest_mode = _backfill_lines_for_source(
+            source, bucket, smart_ctx, build_closet_lines
+        )
+        if wing is None:
             skipped += 1
             continue
-        wing = wing_counter.most_common(1)[0][0]
-        room = room_counter.most_common(1)[0][0] if room_counter else "general"
-        try:
-            lines = build_closet_lines(
-                source, bucket["ids"], "\n\n".join(bucket["docs"]), wing, room
-            )
-        except Exception:
+        if ingest_mode is None:
             failed += 1
             continue
         if not lines:
@@ -566,7 +625,7 @@ def cmd_closets_backfill(args):
             "drawer_count": len(bucket["ids"]),
             "filed_at": datetime.now().isoformat(),
             "normalize_version": NORMALIZE_VERSION,
-            "ingest_mode": "convos-backfill",
+            "ingest_mode": ingest_mode,
             "added_by": "closets-backfill",
         }
         try:
@@ -656,6 +715,17 @@ def main():
             "Code, Codex CLI), seek past the stored byte cursor and "
             "only mine new content. Falls back to full mine for other "
             "formats."
+        ),
+    )
+    p_mine.add_argument(
+        "--smart-closets",
+        action="store_true",
+        help=(
+            "convos mode: build closets via deterministic TF-IDF + "
+            "n-grams + embedder rerank (MMR) instead of the regex "
+            "extractor. Uses the local ONNX embedder already loaded "
+            "by ChromaDB — no LLM, no API key. First invocation on a "
+            "cold palace spends ~30s building a corpus-wide IDF index."
         ),
     )
 
@@ -779,6 +849,16 @@ def main():
     )
     p_closets_backfill.add_argument(
         "--dry-run", action="store_true", help="Show what would be written without writing"
+    )
+    p_closets_backfill.add_argument(
+        "--smart",
+        action="store_true",
+        help=(
+            "Use smart-closet builder (TF-IDF + n-grams + embedder "
+            "rerank) instead of the regex extractor. Deterministic, "
+            "no LLM. First run spends ~30s building a corpus-wide IDF "
+            "index; subsequent runs reuse the cached index."
+        ),
     )
 
     args = parser.parse_args()

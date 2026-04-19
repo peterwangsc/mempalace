@@ -15,6 +15,7 @@ import hashlib
 from pathlib import Path
 from datetime import datetime
 from collections import defaultdict
+from typing import Optional
 
 from .normalize import normalize
 from .palace import (
@@ -547,7 +548,13 @@ def _normalize_tail(filepath: Path, cursor: int, tail_bytes: bytes) -> str:
 
 
 def _rebuild_closets_for_file(
-    drawers_col, closets_col, source_file: str, wing: str, room, agent: str
+    drawers_col,
+    closets_col,
+    source_file: str,
+    wing: str,
+    room,
+    agent: str,
+    smart_ctx: Optional[dict] = None,
 ) -> None:
     """(Re)build the closet index lines for one source file from the
     drawers currently stored for it. Mirrors miner.py:624-648 for the
@@ -590,10 +597,30 @@ def _rebuild_closets_for_file(
         room_for_closet = room_counter.most_common(1)[0][0] if room_counter else "general"
 
     content = "\n\n".join(docs)
-    try:
-        lines = build_closet_lines(source_file, drawer_ids, content, wing, room_for_closet)
-    except Exception:
-        return
+    lines = []
+    ingest_mode = "convos"
+    if smart_ctx and smart_ctx.get("idf_index") and smart_ctx.get("embedder") is not None:
+        from .smart_closets import build_smart_closet_lines
+
+        try:
+            lines = build_smart_closet_lines(
+                source_file,
+                drawer_ids,
+                content,
+                wing,
+                room_for_closet,
+                idf_index=smart_ctx["idf_index"],
+                embedder=smart_ctx["embedder"],
+            )
+            if lines:
+                ingest_mode = "convos-smart"
+        except Exception:
+            lines = []
+    if not lines:
+        try:
+            lines = build_closet_lines(source_file, drawer_ids, content, wing, room_for_closet)
+        except Exception:
+            return
     if not lines:
         return
 
@@ -608,7 +635,7 @@ def _rebuild_closets_for_file(
         "drawer_count": len(drawer_ids),
         "filed_at": datetime.now().isoformat(),
         "normalize_version": NORMALIZE_VERSION,
-        "ingest_mode": "convos",
+        "ingest_mode": ingest_mode,
         "added_by": agent,
     }
     try:
@@ -626,6 +653,7 @@ def _mine_with_cursor(
     agent: str,
     extract_mode: str,
     closets_col=None,
+    smart_ctx: Optional[dict] = None,
 ) -> tuple:
     """Cursor-aware mine for an append-only JSONL source.
 
@@ -764,6 +792,7 @@ def _mine_with_cursor(
             wing,
             room if extract_mode != "general" else None,
             agent,
+            smart_ctx=smart_ctx,
         )
     return drawers_added, room_counts_delta, "ok"
 
@@ -777,6 +806,7 @@ def _file_chunks_locked(
     agent,
     extract_mode,
     closets_col=None,
+    smart_ctx: Optional[dict] = None,
 ):
     """Lock the source file, purge stale drawers, and upsert fresh chunks.
 
@@ -849,6 +879,7 @@ def _file_chunks_locked(
             wing,
             room if extract_mode != "general" else None,
             agent,
+            smart_ctx=smart_ctx,
         )
     return drawers_added, room_counts_delta, False
 
@@ -860,6 +891,7 @@ def _try_cursor_path(
     agent: str,
     extract_mode: str,
     closets_col=None,
+    smart_ctx: Optional[dict] = None,
 ) -> tuple:
     """Attempt the cursor-aware mine path; absorb any unexpected failure.
 
@@ -871,7 +903,13 @@ def _try_cursor_path(
     """
     try:
         return _mine_with_cursor(
-            collection, source_file, wing, agent, extract_mode, closets_col=closets_col
+            collection,
+            source_file,
+            wing,
+            agent,
+            extract_mode,
+            closets_col=closets_col,
+            smart_ctx=smart_ctx,
         )
     except Exception:
         return 0, defaultdict(int), "fallback"
@@ -980,6 +1018,7 @@ def mine_convos(
     dry_run: bool = False,
     extract_mode: str = "exchange",
     cursor: bool = False,
+    smart_closets: bool = False,
 ):
     """Mine a directory of conversation files into the palace.
 
@@ -1032,6 +1071,21 @@ def mine_convos(
     collection = get_collection(palace_path) if not dry_run else None
     closets_col = get_closets_collection(palace_path) if not dry_run else None
 
+    # Smart closets: load (or build) the corpus-wide IDF index and reach the
+    # embedder through the collection adapter. `smart_ctx=None` keeps the
+    # regex pipeline for anyone who doesn't want the extra cost/deps.
+    smart_ctx = None
+    if smart_closets and not dry_run and collection is not None:
+        from .smart_closets import _embedder_from_drawers_col, get_or_build_idf_index
+
+        embedder = _embedder_from_drawers_col(collection)
+        if embedder is not None:
+            idf_index = get_or_build_idf_index(palace_path, collection, progress=True)
+            smart_ctx = {"idf_index": idf_index, "embedder": embedder}
+            print(f"  Smart closets: n_docs={idf_index['n_docs']}, ngrams={len(idf_index['idf'])}")
+        else:
+            print("  Smart closets: embedder unavailable → falling back to regex")
+
     total_drawers = 0
     files_skipped = 0
     room_counts = defaultdict(int)
@@ -1046,7 +1100,13 @@ def mine_convos(
         # existing full-mine path.
         if cursor and not dry_run:
             drawers_added, room_delta, status = _try_cursor_path(
-                collection, source_file, wing, agent, extract_mode, closets_col=closets_col
+                collection,
+                source_file,
+                wing,
+                agent,
+                extract_mode,
+                closets_col=closets_col,
+                smart_ctx=smart_ctx,
             )
             handled, d_delta, s_delta = _consume_cursor_result(
                 drawers_added, room_delta, status, filepath, i, len(files), room_counts
@@ -1113,6 +1173,7 @@ def mine_convos(
             agent,
             extract_mode,
             closets_col=closets_col,
+            smart_ctx=smart_ctx,
         )
         if skipped:
             files_skipped += 1
