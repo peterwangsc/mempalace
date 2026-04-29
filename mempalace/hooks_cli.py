@@ -514,8 +514,13 @@ def _ingest_transcript(transcript_path: str):
                     str(path.parent),
                     "--mode",
                     "convos",
-                    "--wing",
-                    "sessions",
+                    # No --wing: with the per-subdir wing derivation
+                    # (66ee2e5), mining ~/.claude/projects/-Users-X-Y/
+                    # auto-derives wing=_users_x_y, matching the
+                    # canonical wing names already in the palace.
+                    # Hardcoding --wing sessions would create a parallel
+                    # generic wing instead of routing to the project wing.
+                    #
                     # Append-only JSONL: only embed newly-appended bytes,
                     # not the full file each hook fire. Falls back to
                     # full-mine internally for non-eligible files.
