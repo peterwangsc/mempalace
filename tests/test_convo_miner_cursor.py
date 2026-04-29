@@ -427,14 +427,19 @@ class TestMineConvosCursorEndToEnd:
         from mempalace.convo_miner import _read_cursor, mine_convos
         from mempalace.palace import get_collection
 
+        # Content has to clear MIN_CHUNK_SIZE (30 chars per exchange) for
+        # the chunker to actually emit drawers — otherwise the full-mine
+        # path register-files and continues without reaching the cursor
+        # init step. Realistic for cursor mode anyway: short transcripts
+        # don't benefit from incremental ingest.
         f = tmp_path / "s.jsonl"
         _write_jsonl(
             f,
             [
-                _claude_user_line("question one"),
-                _claude_assistant_line("answer one"),
-                _claude_user_line("question two"),
-                _claude_assistant_line("answer two"),
+                _claude_user_line("explain the auth flow architecture please"),
+                _claude_assistant_line("we use jwt tokens with refresh stored in httponly cookies"),
+                _claude_user_line("what is the session storage backend"),
+                _claude_assistant_line("redis with a 24 hour ttl per session record"),
             ],
         )
         mine_convos(convo_dir=str(tmp_path), palace_path=palace_path, wing="w", cursor=True)
@@ -550,21 +555,28 @@ class TestMineConvosCursorEndToEnd:
         from mempalace.palace import get_collection
 
         f = tmp_path / "s.jsonl"
-        # Initial content + a known cursor BEFORE the new tail.
+        # Initial content long enough to clear MIN_CHUNK_SIZE.
         initial = [
-            _claude_user_line("first prompt"),
-            _claude_assistant_line("first response"),
+            _claude_user_line("describe the database migration approach in detail"),
+            _claude_assistant_line(
+                "alembic with autogenerate, reviewed by hand before each release"
+            ),
         ]
         _write_jsonl(f, initial)
         col = get_collection(palace_path)
-        # Position cursor at the start so any new content is "tail".
-        _write_cursor(col, str(f), "w", "a", 1)  # tiny positive offset
-        # Append new content so the cursor < safe_boundary precondition holds.
+        # Position cursor at byte 1 so any new content is "tail" (the
+        # tail will reparse some of the initial line, but the chunker
+        # produces real drawers from the appended content).
+        _write_cursor(col, str(f), "w", "a", 1)
+        # Append new content so the cursor < safe_boundary precondition
+        # holds AND the tail produces a chunkable transcript.
         _append_jsonl(
             f,
             [
-                _claude_user_line("second prompt"),
-                _claude_assistant_line("second response"),
+                _claude_user_line("how do you handle long-running migrations safely"),
+                _claude_assistant_line(
+                    "online ddl with pt-online-schema-change, batched in 10k row chunks"
+                ),
             ],
         )
         prior_cursor = _read_cursor(col, str(f))
