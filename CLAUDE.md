@@ -104,6 +104,32 @@ hooks/                   # Claude Code hook scripts
 - **Tests**: `tests/test_*.py`, fixtures in `tests/conftest.py`
 - **Coverage**: 85% threshold (80% on Windows due to ChromaDB file lock cleanup)
 
+### Wing naming — single canonical rule
+
+**Every wing name in the palace must derive from `normalize_wing_name()` applied to a real path component.** No invented `wing_*` namespaces, no hardcoded constants like `wing_session_stub`, no per-tool variants like `wing_claude` vs `wing_claude_code`. The reason is operational: split conventions silently fragment a project's content across parallel wings, so a search for the chandler project's history misses anything that landed in `wing_chandler` instead of `_users_peterwang_code_chandler`.
+
+The rule has one form, applied everywhere:
+
+```python
+from mempalace.config import normalize_wing_name
+wing = normalize_wing_name(<path-component>)   # lowercase + ' '/'-' → '_'
+```
+
+What `<path-component>` is depends on the call site:
+
+- **Convo mining (`convo_miner.mine_convos`)**: `Path(convo_dir).name` for top-level `--wing` derivation, or per-subdir name when scanning a parent of project dirs.
+- **Hook flow (`hooks_cli`)**: `Path(transcript_path).parent.name` — the encoded project folder Claude Code creates under `~/.claude/projects/-Users-…-<project>/`. This produces `_users_<user>_..._<project>`, which is identical to what a CLI mine of that same directory would produce.
+- **Project mining (`miner.mine`)**: the project root's directory name.
+- **Synthetic / stub writes (SessionEnd stubs, diary checkpoints)**: derived from the same source they describe — usually the transcript path. **Never** invent a new wing for a synthetic entry; route it to the wing the actual content lives in.
+
+When adding a code path that creates a wing:
+
+1. Identify the path component the wing represents.
+2. Run it through `normalize_wing_name`.
+3. If you need a fallback for "no path available," prefer `_sessions` (canonical-prefixed) over `wing_sessions` (legacy/divergent). Never invent a new namespace.
+
+Reviewing PRs that introduce new wing-creating code: reject any new string-template wing name (`f"wing_{x}"`, `"sessions"`, etc.) that isn't ultimately the output of `normalize_wing_name`.
+
 ## Architecture
 
 ```
