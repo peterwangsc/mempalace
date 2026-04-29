@@ -891,8 +891,42 @@ def hook_session_start(data: dict, harness: str):
     _output({})
 
 
+PRECOMPACT_CUSTOM_INSTRUCTIONS = """\
+The full verbatim transcript of this session has already been mined into
+MemPalace (drawers + closets, routed to the canonical project wing). A
+multi-paragraph prose summary is therefore redundant — anything you would
+say can be retrieved verbatim by searching the palace.
+
+Override the default summary. Output ONLY a list of 3-5 mempalace_search
+queries that, run in a fresh session, would let the next agent recover
+the substance of THIS conversation. Choose queries that:
+  - Use distinctive, project-specific terms (file names, symbols, error
+    strings, named decisions) — not generic words like "fix" or "code".
+  - Cover the major threads of the conversation, not just the most
+    recent topic.
+  - Span the actual scope discussed: what was attempted, what failed,
+    what landed, what remains.
+
+Format the output as a markdown bulleted list, each line a single search
+query in backticks. No prose, no preamble, no closing remarks. Just the
+queries. Example shape (NOT the content):
+
+  - `<distinctive query 1>`
+  - `<distinctive query 2>`
+  - `<distinctive query 3>`
+"""
+
+
 def hook_precompact(data: dict, harness: str):
-    """Precompact hook: mine transcript synchronously, then allow compaction."""
+    """Precompact hook: mine transcript, override compaction prompt to
+    output recovery search queries instead of a prose summary.
+
+    The verbatim transcript is already captured in the palace by
+    _ingest_transcript before compaction runs, so the compaction summary
+    is redundant. We replace it with 3-5 distinctive search queries — a
+    breadcrumb the next session can use to find the verbatim content
+    back via mempalace_search.
+    """
     parsed = _parse_harness_input(data, harness)
     session_id = parsed["session_id"]
     transcript_path = parsed["transcript_path"]
@@ -918,7 +952,7 @@ def hook_precompact(data: dict, harness: str):
     if _write_session_end_stub(session_id, transcript_path, "precompact", cwd):
         _log(f"PRE-COMPACT stub written for session {session_id}")
 
-    _output({})
+    _output({"newCustomInstructions": PRECOMPACT_CUSTOM_INSTRUCTIONS})
 
 
 def hook_session_end(data: dict, harness: str):
