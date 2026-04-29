@@ -491,11 +491,15 @@ def _ingest_transcript(transcript_path: str):
                     "convos",
                     "--wing",
                     "sessions",
+                    # Append-only JSONL: only embed newly-appended bytes,
+                    # not the full file each hook fire. Falls back to
+                    # full-mine internally for non-eligible files.
+                    "--cursor",
                 ],
                 stdout=log_f,
                 stderr=log_f,
             )
-        _log(f"Transcript ingest started: {path.name}")
+        _log(f"Transcript ingest started (cursor mode): {path.name}")
     except OSError:
         pass
 
