@@ -70,7 +70,6 @@ PRECOMPACT_BLOCK_REASON = (
 
 # SessionEnd timeout in Claude Code is hard-capped at 1500ms by default.
 # Anything heavier MUST be detached so it survives parent shutdown.
-SESSION_END_STUB_WING = "wing_session_stub"
 
 
 def _sanitize_session_id(session_id: str) -> str:
@@ -677,8 +676,13 @@ def _write_session_end_stub(
     )
     body = "\n".join(body_lines)
 
+    # Route the stub to the project wing (same wing the cursor mine
+    # writes drawers into for this transcript) — keeps the entire
+    # session's content in one searchable wing instead of splitting
+    # the synthetic marker into a generic stub namespace.
+    wing = _wing_from_transcript_path(transcript_path)
     entry_id = (
-        f"diary_{SESSION_END_STUB_WING}_{now.strftime('%Y%m%d_%H%M%S%f')}_"
+        f"diary_{wing}_{now.strftime('%Y%m%d_%H%M%S%f')}_"
         f"{re.sub(r'[^a-zA-Z0-9]', '', session_id)[:16]}"
     )
     try:
@@ -687,7 +691,7 @@ def _write_session_end_stub(
             documents=[body],
             metadatas=[
                 {
-                    "wing": SESSION_END_STUB_WING,
+                    "wing": wing,
                     "room": "diary",
                     "hall": "hall_diary",
                     "type": "session_end_stub",
@@ -719,36 +723,38 @@ def _parse_harness_input(data: dict, harness: str) -> dict:
 
 
 def _wing_from_transcript_path(transcript_path: str) -> str:
-    """Derive a project wing name from a Claude Code transcript path.
+    """Derive the canonical wing for a transcript path.
 
-    Claude Code encodes the project's source directory by replacing path
-    separators with dashes, producing folders like:
-        ~/.claude/projects/-home-<user>-Projects-<project>/session.jsonl
-        ~/.claude/projects/-home-<user>-dev-<parent>-<project>/session.jsonl
-        ~/.claude/projects/-Users-<user>-<folder>-<project>/session.jsonl
+    Wing convention: the wing for a transcript is the same wing the
+    convo miner would derive when given that transcript's parent
+    directory — i.e. ``normalize_wing_name(parent.name)``. This keeps
+    diary checkpoints, SessionEnd stubs, and verbatim drawer ingest
+    all routed to the SAME wing for a given project.
 
-    The project directory name is the final dash-separated token of the
-    encoded folder. Returns ``wing_<project>`` (lowercased, spaces → ``_``).
-    Falls back to ``wing_sessions`` if the path does not match a Claude Code
-    project-folder layout.
+    For Claude Code transcripts at
+        ~/.claude/projects/-Users-<user>-code-<project>/<session>.jsonl
+    the parent dir name is ``-Users-<user>-code-<project>`` which
+    normalizes to ``_users_<user>_code_<project>`` — exactly what
+    ``mine_convos`` produces.
+
+    Falls back to ``_sessions`` (canonical-prefixed, NOT ``wing_sessions``)
+    only when no transcript path is supplied. Empty path → empty fallback
+    that callers can reject. Never invents a new ``wing_*`` namespace —
+    every legitimate wing on disk ultimately derives from
+    ``normalize_wing_name`` so that the same project name produces the
+    same wing across CLI mining, hook ingest, and synthetic stubs.
     """
-    # Normalize path separators for cross-platform (Windows backslashes)
-    normalized = transcript_path.replace("\\", "/")
-    # Primary: pull the encoded project folder out of ``.claude/projects/``
-    # and take its last dash-separated token.
-    match = re.search(r"/\.claude/projects/-([^/]+)", normalized)
-    if match:
-        encoded = match.group(1)
-        project = encoded.rsplit("-", 1)[-1]
-        if project:
-            return f"wing_{project.lower().replace(' ', '_')}"
-    # Legacy fallback: explicit ``-Projects-<name>`` segment, useful for
-    # transcripts not under the standard Claude Code projects dir.
-    match = re.search(r"-Projects-([^/]+?)(?:/|$)", normalized)
-    if match:
-        project = match.group(1).lower().replace(" ", "_")
-        return f"wing_{project}"
-    return "wing_sessions"
+    if not transcript_path:
+        return "_sessions"
+    try:
+        from .config import normalize_wing_name
+    except Exception:
+        return "_sessions"
+    parent = Path(transcript_path).expanduser().parent
+    name = parent.name
+    if not name:
+        return "_sessions"
+    return normalize_wing_name(name)
 
 
 def hook_stop(data: dict, harness: str):
