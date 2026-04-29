@@ -855,11 +855,22 @@ def _file_chunks_locked(
             batch_docs: list = []
             batch_ids: list = []
             batch_metas: list = []
+            seen_ids: set = set()
             for chunk in chunks[batch_start : batch_start + DRAWER_UPSERT_BATCH_SIZE]:
                 chunk_room = chunk.get("memory_type", room) if extract_mode == "general" else room
+                drawer_id = f"drawer_{wing}_{chunk_room}_{hashlib.sha256((source_file + chunk['content']).encode()).hexdigest()[:24]}"
+                # Content-addressed IDs collide for repeated content within a
+                # source file (e.g. cursor tail re-encountering pre-mined
+                # exchanges, or boilerplate echoed across turns). chroma
+                # rejects duplicate IDs *within* an upsert batch even though
+                # upsert is otherwise idempotent across batches — so we
+                # de-dup per-batch. Skipping is correct: the prior occurrence
+                # already carries the same content/metadata.
+                if drawer_id in seen_ids:
+                    continue
+                seen_ids.add(drawer_id)
                 if extract_mode == "general":
                     room_counts_delta[chunk_room] += 1
-                drawer_id = f"drawer_{wing}_{chunk_room}_{hashlib.sha256((source_file + chunk['content']).encode()).hexdigest()[:24]}"
                 batch_docs.append(chunk["content"])
                 batch_ids.append(drawer_id)
                 batch_metas.append(
@@ -876,6 +887,8 @@ def _file_chunks_locked(
                         "normalize_version": NORMALIZE_VERSION,
                     }
                 )
+            if not batch_ids:
+                continue
             try:
                 collection.upsert(
                     documents=batch_docs,
