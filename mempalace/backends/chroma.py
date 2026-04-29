@@ -1,6 +1,5 @@
 """ChromaDB-backed MemPalace collection adapter."""
 
-import datetime as _dt
 import logging
 import os
 import sqlite3
@@ -10,79 +9,6 @@ import chromadb
 from .base import BaseCollection
 
 logger = logging.getLogger(__name__)
-
-
-def quarantine_stale_hnsw(palace_path: str, stale_seconds: float = 3600.0) -> list[str]:
-    """Rename HNSW segment dirs whose files are stale vs. chroma.sqlite3.
-
-    When a ChromaDB 1.5.x PersistentClient opens a palace whose on-disk
-    HNSW segment is significantly older than ``chroma.sqlite3``, the Rust
-    graph-walk can dereference dangling neighbor pointers for entries that
-    exist in the metadata segment but not in the HNSW index, and segfault
-    in a background thread on the next ``count()`` or ``query(...)`` call.
-
-    This is the same failure mode reported at #823 (semantic search stale
-    after ``add_drawer``), observed at neo-cortex-mcp#2 (SIGSEGV on
-    ``count()`` with chromadb 1.5.5), and acknowledged as by-design at
-    chroma-core/chroma#2594.
-
-    Heuristic: if ``chroma.sqlite3`` is more than ``stale_seconds`` newer
-    than the segment's ``data_level0.bin``, the segment is considered
-    suspect and renamed to ``<uuid>.drift-<timestamp>``. ChromaDB reopens
-    cleanly without it and writes fresh index files on next use. The
-    original directory is renamed, not deleted, so recovery remains
-    possible if the heuristic misfires.
-
-    Args:
-        palace_path: path to the palace directory containing ``chroma.sqlite3``
-        stale_seconds: minimum mtime gap to treat a segment as stale
-
-    Returns:
-        List of paths that were quarantined (empty if nothing drifted).
-    """
-    db_path = os.path.join(palace_path, "chroma.sqlite3")
-    if not os.path.isfile(db_path):
-        return []
-    try:
-        sqlite_mtime = os.path.getmtime(db_path)
-    except OSError:
-        return []
-
-    moved: list[str] = []
-    try:
-        entries = os.listdir(palace_path)
-    except OSError:
-        return []
-
-    for name in entries:
-        if "-" not in name or name.startswith(".") or ".drift-" in name:
-            continue
-        seg_dir = os.path.join(palace_path, name)
-        if not os.path.isdir(seg_dir):
-            continue
-        hnsw_bin = os.path.join(seg_dir, "data_level0.bin")
-        if not os.path.isfile(hnsw_bin):
-            continue
-        try:
-            hnsw_mtime = os.path.getmtime(hnsw_bin)
-        except OSError:
-            continue
-        if sqlite_mtime - hnsw_mtime < stale_seconds:
-            continue
-        stamp = _dt.datetime.now().strftime("%Y%m%d-%H%M%S")
-        target = f"{seg_dir}.drift-{stamp}"
-        try:
-            os.rename(seg_dir, target)
-            moved.append(target)
-            logger.warning(
-                "Quarantined stale HNSW segment %s (sqlite %.0fs newer than HNSW); renamed to %s",
-                seg_dir,
-                sqlite_mtime - hnsw_mtime,
-                target,
-            )
-        except OSError:
-            logger.exception("Failed to quarantine stale HNSW segment %s", seg_dir)
-    return moved
 
 
 def _fix_blob_seq_ids(palace_path: str):
@@ -159,8 +85,6 @@ class ChromaBackend:
     def _client(self, palace_path: str):
         """Return a cached PersistentClient for *palace_path*, creating one if needed."""
         if palace_path not in self._clients:
-            if not os.environ.get("MEMPALACE_HNSW_NO_QUARANTINE"):
-                quarantine_stale_hnsw(palace_path)
             _fix_blob_seq_ids(palace_path)
             self._clients[palace_path] = chromadb.PersistentClient(path=palace_path)
         return self._clients[palace_path]
@@ -176,8 +100,6 @@ class ChromaBackend:
         Intended for long-lived callers (e.g. mcp_server) that keep their own
         inode/mtime-based client cache.
         """
-        if not os.environ.get("MEMPALACE_HNSW_NO_QUARANTINE"):
-            quarantine_stale_hnsw(palace_path)
         _fix_blob_seq_ids(palace_path)
         return chromadb.PersistentClient(path=palace_path)
 
