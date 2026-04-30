@@ -142,9 +142,22 @@ def _segment_appears_healthy(seg_dir: str) -> bool:
     """
     meta_path = os.path.join(seg_dir, "index_metadata.pickle")
     if not os.path.isfile(meta_path):
-        # No metadata file yet — segment hasn't flushed (fresh / empty).
-        # Renaming would orphan nothing; consider healthy.
-        return True
+        # No metadata file. Two cases:
+        #  - Truly fresh / empty: data_level0.bin is absent or 0 bytes
+        #    too. Renaming would orphan nothing; consider healthy.
+        #  - Mid-write corruption: data_level0.bin is non-empty (HNSW
+        #    data was written) but the pickle never landed (chromadb
+        #    crashed mid-flush, or sync_threshold was never crossed —
+        #    the closet-flush incident leaves segments in exactly this
+        #    shape). The next PersistentClient open SIGSEGVs in
+        #    chromadb's Rust HNSW loader, so this case must NOT be
+        #    classified healthy.
+        data_path = os.path.join(seg_dir, "data_level0.bin")
+        try:
+            data_size = os.path.getsize(data_path) if os.path.isfile(data_path) else 0
+        except OSError:
+            return False
+        return data_size == 0
     try:
         size = os.path.getsize(meta_path)
         # A real chromadb metadata file is at least tens of bytes; a
@@ -972,6 +985,16 @@ class ChromaBackend(BaseBackend):
 
         if cached is None or inode_changed or mtime_changed or mtime_appeared:
             _fix_blob_seq_ids(palace_path)
+            # Cold-start protection: same once-per-palace-per-process
+            # quarantine that ``make_client`` performs. Without this,
+            # ``mempalace repair --mode legacy`` (and any other code path
+            # going through ``get_collection``) opens chromadb against
+            # any stale-corrupt segment and SIGSEGVs in the Rust HNSW
+            # loader. ``_quarantined_paths`` keeps the cost at O(1) for
+            # subsequent reopens within the same process.
+            if palace_path not in ChromaBackend._quarantined_paths:
+                quarantine_stale_hnsw(palace_path)
+                ChromaBackend._quarantined_paths.add(palace_path)
             cached = chromadb.PersistentClient(path=palace_path)
             self._clients[palace_path] = cached
             # Re-stat after the client constructor runs: chromadb creates
