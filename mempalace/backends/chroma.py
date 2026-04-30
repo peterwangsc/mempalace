@@ -480,12 +480,47 @@ def hnsw_capacity_status(palace_path: str, collection_name: str = "mempalace_dra
         out["hnsw_count"] = hnsw_count
 
         if hnsw_count is None:
-            # No pickle yet — segment hasn't persisted metadata. Could be
-            # fresh-but-unflushed (normal) or interrupted-mid-flush (bad).
-            # We can't distinguish without the pickle, so only flag
-            # divergence when sqlite holds clearly more than two flush
-            # windows worth — same threshold as the with-pickle path.
-            if sqlite_count > _HNSW_DIVERGENCE_ABSOLUTE:
+            # No pickle. Three sub-cases distinguished by what's on disk:
+            #
+            #  A) Segment dir exists with non-empty ``data_level0.bin``: the
+            #     binary HNSW is loadable. chromadb's Rust path skips a
+            #     missing pickle and loads directly from the binary — that's
+            #     the documented workaround for the dimensionality=None
+            #     pickle bug (mempalace#1103 / chromadb null-deref on
+            #     count()). Vector search works; this is NOT divergence,
+            #     just an unflushed pickle. Use ``sqlite_count`` as the
+            #     displayed count because the binary mirrors sqlite state
+            #     by virtue of being loadable.
+            #
+            #  B) Segment dir absent or ``data_level0.bin`` empty/missing
+            #     AND sqlite holds clearly more than two flush windows
+            #     worth: real divergence — the segment has never received
+            #     any persisted data even though sqlite has substantial
+            #     content. Existing #1222 behavior; recommend ``mempalace
+            #     repair``.
+            #
+            #  C) Empty/fresh segment under threshold: skip.
+            seg_dir = os.path.join(palace_path, seg_id)
+            data_path = os.path.join(seg_dir, "data_level0.bin")
+            try:
+                data_size = (
+                    os.path.getsize(data_path) if os.path.isfile(data_path) else 0
+                )
+            except OSError:
+                data_size = 0
+
+            if data_size > 0:
+                # Sub-case A: binary present, pickle absent.
+                out["hnsw_count"] = sqlite_count
+                out["divergence"] = 0
+                out["status"] = "ok"
+                out["message"] = (
+                    f"HNSW {sqlite_count:,} / sqlite {sqlite_count:,} "
+                    "(pickle absent — binary loadable; common after the "
+                    "#1103 dimensionality=None workaround)"
+                )
+            elif sqlite_count > _HNSW_DIVERGENCE_ABSOLUTE:
+                # Sub-case B: existing #1222 behavior unchanged.
                 out["status"] = "diverged"
                 out["diverged"] = True
                 out["divergence"] = sqlite_count
@@ -495,6 +530,7 @@ def hnsw_capacity_status(palace_path: str, collection_name: str = "mempalace_dra
                     "until the segment is rebuilt. Run `mempalace repair`."
                 )
             else:
+                # Sub-case C: empty/fresh, under threshold.
                 out["message"] = "HNSW segment metadata not yet flushed; skipping"
             return out
 

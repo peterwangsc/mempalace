@@ -214,13 +214,81 @@ def test_capacity_status_tolerates_flush_lag(tmp_path):
 
 
 def test_capacity_status_flags_unflushed_with_large_sqlite(tmp_path):
-    """No pickle + many sqlite rows is its own divergence signal."""
+    """No pickle + no on-disk segment + many sqlite rows is real divergence.
+
+    This is the #1222 case: the segment has never written anything to
+    disk, sqlite has substantial content, vector search returns nothing
+    until rebuild. The capacity probe must flag it so callers fall back
+    to BM25 or run repair.
+    """
     seg = "seg-noflush"
     _seed_chroma_db(str(tmp_path), sqlite_count=10_000, segment_id=seg)
+    # Deliberately do NOT create the segment dir — this is the
+    # "never wrote anything" case, distinct from "wrote binary but
+    # not pickle" covered below.
     info = hnsw_capacity_status(str(tmp_path), COLLECTION)
     assert info["diverged"] is True
     assert info["hnsw_count"] is None
     assert "never flushed" in info["message"]
+
+
+def test_capacity_status_pickle_absent_but_binary_present_reports_ok(tmp_path):
+    """Pickle absent + populated ``data_level0.bin`` is the post-#1103-
+    workaround state: the corrupt ``dimensionality: None`` pickle has
+    been deleted and chromadb's Rust loader falls through to the binary
+    HNSW. Vector search works; the probe must NOT flag this as DIVERGED.
+
+    Reproduces the live state of Peter's drawers segment after we
+    applied the #1103 workaround on 2026-04-29: pickle deleted,
+    ``data_level0.bin`` ~255 MB, chromadb count() and query() both
+    succeed via the binary path. ``repair-status`` previously reported
+    DIVERGED here because ``_hnsw_element_count`` returned None and the
+    heuristic only saw "no pickle + sqlite >> threshold". The new
+    behavior treats the populated-binary case as loadable, displays
+    sqlite_count as the assumed count (the binary mirrors sqlite state
+    by virtue of being loadable), and includes a note pointing at the
+    documented workaround so a future maintainer doesn't mistake this
+    for a corruption signal.
+    """
+    seg = "seg-pickle-deleted"
+    _seed_chroma_db(str(tmp_path), sqlite_count=132_275, segment_id=seg)
+
+    # Materialize the segment dir with a non-empty data_level0.bin and
+    # NO pickle — exactly the post-workaround on-disk shape.
+    seg_dir = os.path.join(str(tmp_path), seg)
+    os.makedirs(seg_dir, exist_ok=True)
+    with open(os.path.join(seg_dir, "data_level0.bin"), "wb") as f:
+        f.write(b"\x00" * 200_000)
+
+    info = hnsw_capacity_status(str(tmp_path), COLLECTION)
+    assert info["status"] == "ok", info
+    assert info["diverged"] is False
+    assert info["hnsw_count"] == 132_275, (
+        "displayed count should fall back to sqlite_count when the binary "
+        "segment is loadable but the pickle is absent"
+    )
+    assert info["divergence"] == 0
+    assert "pickle absent" in info["message"].lower()
+    assert "loadable" in info["message"].lower()
+
+
+def test_capacity_status_pickle_absent_with_empty_data_file_still_skips(tmp_path):
+    """A 0-byte ``data_level0.bin`` is equivalent to no data file —
+    don't fall into the "loadable" branch just because the file
+    exists; the segment really hasn't written anything yet.
+    """
+    seg = "seg-empty-data"
+    _seed_chroma_db(str(tmp_path), sqlite_count=500, segment_id=seg)
+    seg_dir = os.path.join(str(tmp_path), seg)
+    os.makedirs(seg_dir, exist_ok=True)
+    open(os.path.join(seg_dir, "data_level0.bin"), "wb").close()  # 0 bytes
+
+    info = hnsw_capacity_status(str(tmp_path), COLLECTION)
+    # Under the divergence threshold and no real binary on disk →
+    # quiet "not yet flushed" status, NOT a false-positive OK.
+    assert info["diverged"] is False
+    assert info["status"] != "ok"  # specifically: should be "unknown"
+    assert info["hnsw_count"] is None
 
 
 def test_capacity_status_quiet_for_empty_palace(tmp_path):
