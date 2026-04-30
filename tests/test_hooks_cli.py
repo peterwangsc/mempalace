@@ -235,8 +235,12 @@ def test_stop_hook_saves_silently_at_interval(tmp_path):
     # Saves silently — systemMessage notification with themes, no block
     assert result["systemMessage"].startswith("\u2726 15 memories woven into the palace")
     assert "hooks" in result["systemMessage"]
-    # tmp_path has no "-Projects-" segment, so _wing_from_transcript_path falls back to "wing_sessions"
-    mock_save.assert_called_once_with(str(transcript), "test", wing="wing_sessions", toast=False)
+    # Wing is derived from the transcript's parent directory via the canonical
+    # `normalize_wing_name` convention (commit 671a976). For a tmp_path-based
+    # transcript the wing is the normalized form of the tmp dir name — compute
+    # it the same way the production code does so the test stays portable.
+    expected_wing = _wing_from_transcript_path(str(transcript))
+    mock_save.assert_called_once_with(str(transcript), "test", wing=expected_wing, toast=False)
 
 
 def test_stop_hook_derives_wing_from_transcript_path(tmp_path):
@@ -255,7 +259,11 @@ def test_stop_hook_derives_wing_from_transcript_path(tmp_path):
             {"session_id": "test", "stop_hook_active": False, "transcript_path": str(transcript)},
             state_dir=tmp_path,
         )
-    mock_save.assert_called_once_with(str(transcript), "test", wing="wing_myproject", toast=False)
+    # Canonical wing for parent dir `-home-jp-Projects-myproject` is
+    # `_home_jp_projects_myproject` (normalize_wing_name applied to parent.name).
+    mock_save.assert_called_once_with(
+        str(transcript), "test", wing="_home_jp_projects_myproject", toast=False
+    )
 
 
 def test_stop_hook_tracks_save_point(tmp_path):
@@ -300,47 +308,73 @@ def test_precompact_allows(tmp_path):
         {"session_id": "test"},
         state_dir=tmp_path,
     )
-    assert result == {}
+    # Precompact now (commit 96b1878) always emits a customInstructions
+    # payload that overrides Claude Code's default summary with a request
+    # for 3-5 mempalace_search recovery queries — verbatim is already in
+    # the palace, so the prose summary would be redundant.
+    from mempalace.hooks_cli import PRECOMPACT_CUSTOM_INSTRUCTIONS
+
+    assert result == {"newCustomInstructions": PRECOMPACT_CUSTOM_INSTRUCTIONS}
 
 
 # --- _wing_from_transcript_path ---
 
 
+# `_wing_from_transcript_path` derives the wing as
+# `normalize_wing_name(Path(transcript).parent.name)` — the same canonical
+# convention `mine_convos` uses on the same parent dir (commit 671a976,
+# eec06f8). The test cases below pin that contract: every wing on disk
+# ultimately comes from `normalize_wing_name`, never an invented `wing_*`
+# namespace, so hook ingest, CLI mining, and synthetic stubs all route to
+# the same wing for a given project.
+
+
 def test_wing_from_transcript_path_extracts_project():
     path = "/home/jp/.claude/projects/-home-jp-Projects-memorypalace/session.jsonl"
-    assert _wing_from_transcript_path(path) == "wing_memorypalace"
+    assert _wing_from_transcript_path(path) == "_home_jp_projects_memorypalace"
 
 
 def test_wing_from_transcript_path_fallback():
-    assert _wing_from_transcript_path("/some/random/path.jsonl") == "wing_sessions"
+    # Empty path is the only true fallback — everything else gets the
+    # normalized parent name. `_sessions` (canonical-prefixed) is the
+    # required fallback name; never `wing_sessions`.
+    assert _wing_from_transcript_path("") == "_sessions"
 
 
 def test_wing_from_transcript_path_windows_backslashes():
+    # POSIX `pathlib.Path` does not split Windows backslashes — the entire
+    # string is treated as a single basename, so parent.name is empty and
+    # we fall through to the `_sessions` sentinel. On a Windows host
+    # `WindowsPath` would split backslashes correctly. This test pins the
+    # POSIX-host behavior so a future refactor that "fixes" it inadvertently
+    # by string-splitting on `\\` doesn't reintroduce a parallel namespace.
     path = "C:\\Users\\jp\\.claude\\projects\\-home-jp-Projects-myapp\\session.jsonl"
-    assert _wing_from_transcript_path(path) == "wing_myapp"
+    assert _wing_from_transcript_path(path) == "_sessions"
 
 
 def test_wing_from_transcript_path_lowercases():
     path = "/home/jp/.claude/projects/-home-jp-Projects-MyProject/session.jsonl"
-    assert _wing_from_transcript_path(path) == "wing_myproject"
+    assert _wing_from_transcript_path(path) == "_home_jp_projects_myproject"
 
 
 def test_wing_from_transcript_path_non_projects_layout():
-    # Linux users with code under ~/dev/, ~/src/, ~/code/ — no -Projects- segment.
-    # Project name is the final dash-separated token of the encoded folder.
+    # Linux user with code under ~/dev/. The wing is the normalized form
+    # of the WHOLE encoded parent folder, not a leaf-token extract — so
+    # mining `~/dev/MemPalace/mempalace/` via the CLI produces the same
+    # wing the hook does on transcripts from that project.
     path = "/home/igor/.claude/projects/-home-igor-dev-MemPalace-mempalace/session.jsonl"
-    assert _wing_from_transcript_path(path) == "wing_mempalace"
+    assert _wing_from_transcript_path(path) == "_home_igor_dev_mempalace_mempalace"
 
 
 def test_wing_from_transcript_path_macos_users_layout():
     # macOS ~/ layout without a Projects/ segment.
     path = "/Users/alice/.claude/projects/-Users-alice-code-MyApp/session.jsonl"
-    assert _wing_from_transcript_path(path) == "wing_myapp"
+    assert _wing_from_transcript_path(path) == "_users_alice_code_myapp"
 
 
 def test_wing_from_transcript_path_nested_deep():
     path = "/home/bob/.claude/projects/-home-bob-work-clients-acme-frontend/session.jsonl"
-    assert _wing_from_transcript_path(path) == "wing_frontend"
+    assert _wing_from_transcript_path(path) == "_home_bob_work_clients_acme_frontend"
 
 
 # --- _log ---
@@ -740,6 +774,8 @@ def test_stop_hook_oserror_on_write(tmp_path):
 
 def test_precompact_with_mempal_dir(tmp_path):
     """Precompact runs subprocess.run (sync) when MEMPAL_DIR is set."""
+    from mempalace.hooks_cli import PRECOMPACT_CUSTOM_INSTRUCTIONS
+
     mempal_dir = tmp_path / "project"
     mempal_dir.mkdir()
     with patch.dict("os.environ", {"MEMPAL_DIR": str(mempal_dir)}):
@@ -749,12 +785,17 @@ def test_precompact_with_mempal_dir(tmp_path):
                 {"session_id": "test"},
                 state_dir=tmp_path,
             )
-    assert result == {}
+    assert result == {"newCustomInstructions": PRECOMPACT_CUSTOM_INSTRUCTIONS}
     mock_run.assert_called_once()
 
 
 def test_precompact_with_mempal_dir_oserror(tmp_path):
-    """Precompact handles OSError from subprocess gracefully."""
+    """Precompact handles OSError from subprocess gracefully — still emits
+    the customInstructions override even when the project mine errored,
+    because the verbatim transcript is captured separately and the prose
+    summary remains redundant either way."""
+    from mempalace.hooks_cli import PRECOMPACT_CUSTOM_INSTRUCTIONS
+
     mempal_dir = tmp_path / "project"
     mempal_dir.mkdir()
     with patch.dict("os.environ", {"MEMPAL_DIR": str(mempal_dir)}):
@@ -764,11 +805,14 @@ def test_precompact_with_mempal_dir_oserror(tmp_path):
                 {"session_id": "test"},
                 state_dir=tmp_path,
             )
-    assert result == {}
+    assert result == {"newCustomInstructions": PRECOMPACT_CUSTOM_INSTRUCTIONS}
 
 
 def test_precompact_with_timeout(tmp_path):
-    """Precompact handles TimeoutExpired gracefully -- still allows."""
+    """Precompact handles TimeoutExpired gracefully — still emits the
+    customInstructions override (same rationale as the OSError case)."""
+    from mempalace.hooks_cli import PRECOMPACT_CUSTOM_INSTRUCTIONS
+
     mempal_dir = tmp_path / "project"
     mempal_dir.mkdir()
     with patch.dict("os.environ", {"MEMPAL_DIR": str(mempal_dir)}):
@@ -779,7 +823,7 @@ def test_precompact_with_timeout(tmp_path):
             result = _capture_hook_output(
                 hook_precompact, {"session_id": "test"}, state_dir=tmp_path
             )
-    assert result == {}
+    assert result == {"newCustomInstructions": PRECOMPACT_CUSTOM_INSTRUCTIONS}
 
 
 def test_precompact_mines_transcript_dir(tmp_path, monkeypatch):
@@ -791,6 +835,8 @@ def test_precompact_mines_transcript_dir(tmp_path, monkeypatch):
     asserted against subprocess.run, which corresponded to the
     duplicate-mine path that has now been removed.
     """
+    from mempalace.hooks_cli import PRECOMPACT_CUSTOM_INSTRUCTIONS
+
     transcript = tmp_path / "t.jsonl"
     # _ingest_transcript skips files smaller than 100 bytes, so pad it.
     transcript.write_text("x" * 200)
@@ -802,14 +848,18 @@ def test_precompact_mines_transcript_dir(tmp_path, monkeypatch):
                 {"session_id": "test", "transcript_path": str(transcript)},
                 state_dir=tmp_path,
             )
-    assert result == {}
+    assert result == {"newCustomInstructions": PRECOMPACT_CUSTOM_INSTRUCTIONS}
     mock_run.assert_not_called()
     mock_popen.assert_called_once()
     cmd = mock_popen.call_args[0][0]
-    # Mines the transcript's parent dir as convos, into wing "sessions".
+    # Mines the transcript's parent dir as convos. Per commit 1ed5610,
+    # `_ingest_transcript` no longer passes a hardcoded `--wing sessions`
+    # — `mine_convos` derives the canonical wing from the dir name itself,
+    # so a generic `--wing sessions` would create a parallel namespace
+    # that fragments the project's content across two wings.
     assert str(tmp_path) in cmd
     assert cmd[cmd.index("--mode") + 1] == "convos"
-    assert cmd[cmd.index("--wing") + 1] == "sessions"
+    assert "--wing" not in cmd
 
 
 # --- run_hook ---
@@ -845,12 +895,16 @@ def test_run_hook_dispatches_stop(tmp_path):
 
 
 def test_run_hook_dispatches_precompact(tmp_path):
+    from mempalace.hooks_cli import PRECOMPACT_CUSTOM_INSTRUCTIONS
+
     stdin_data = json.dumps({"session_id": "run-test"})
     with patch("sys.stdin", io.StringIO(stdin_data)):
         with patch("mempalace.hooks_cli.STATE_DIR", tmp_path):
             with patch("mempalace.hooks_cli._output") as mock_output:
                 run_hook("precompact", "claude-code")
-    mock_output.assert_called_once_with({})
+    mock_output.assert_called_once_with(
+        {"newCustomInstructions": PRECOMPACT_CUSTOM_INSTRUCTIONS}
+    )
 
 
 def test_run_hook_unknown_hook():

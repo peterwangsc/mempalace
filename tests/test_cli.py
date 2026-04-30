@@ -476,6 +476,7 @@ def test_cmd_mine_convos_mode(mock_config_cls):
             dry_run=True,
             extract_mode="general",
             cursor=False,
+            smart_closets=False,
         )
 
 
