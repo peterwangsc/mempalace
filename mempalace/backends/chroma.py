@@ -53,6 +53,41 @@ _HNSW_BLOAT_GUARD = {
     "hnsw:sync_threshold": 50_000,
 }
 
+# Small-collection variant of the bloat guard. Closets and other indexes
+# whose total size is bounded well below the resize-cycle threshold (~10k
+# entries — see PR #344) never reach `sync_threshold=50_000` and would
+# leave their HNSW pickle permanently unflushed. `hnsw_capacity_status`
+# then reports them DIVERGED once sqlite crosses 2,000 rows, search
+# falls through to BM25-only, and `mempalace repair --mode legacy` is
+# the recommended remedy — but rebuilding a never-flushed segment hits
+# chromadb's missing-pickle path and SIGSEGVs on 1.5.x.
+#
+# A 100-item threshold flushes during normal closet upsert batches
+# without re-introducing the resize-cycle bloat (which only fires when
+# a single collection grows past ~10k items).
+_HNSW_BLOAT_GUARD_SMALL = {
+    "hnsw:batch_size": 100,
+    "hnsw:sync_threshold": 100,
+}
+
+# Collection names whose total size is bounded well below 10k entries
+# and therefore need the small-collection guard. Adding a name here is
+# a deliberate signal that the collection is index-shaped (closets,
+# summaries, etc.) rather than verbatim drawer storage.
+_SMALL_COLLECTIONS = frozenset({"mempalace_closets"})
+
+
+def _hnsw_metadata_for(collection_name: str) -> dict:
+    """Return the HNSW guard metadata appropriate for ``collection_name``.
+
+    Bounded-size index collections (``mempalace_closets``) get a low
+    sync threshold so their pickle actually flushes during normal use.
+    Drawer-shaped collections keep the 50_000 guard from PR #344.
+    """
+    if collection_name in _SMALL_COLLECTIONS:
+        return _HNSW_BLOAT_GUARD_SMALL
+    return _HNSW_BLOAT_GUARD
+
 
 def _validate_where(where: Optional[dict]) -> None:
     """Scan a where-clause for unknown operators and raise ``UnsupportedFilterError``.
@@ -1042,7 +1077,7 @@ class ChromaBackend(BaseBackend):
                 metadata={
                     "hnsw:space": hnsw_space,
                     "hnsw:num_threads": 1,
-                    **_HNSW_BLOAT_GUARD,
+                    **_hnsw_metadata_for(collection_name),
                 },
                 **ef_kwargs,
             )
@@ -1096,7 +1131,7 @@ class ChromaBackend(BaseBackend):
             metadata={
                 "hnsw:space": hnsw_space,
                 "hnsw:num_threads": 1,
-                **_HNSW_BLOAT_GUARD,
+                **_hnsw_metadata_for(collection_name),
             },
             **ef_kwargs,
         )
