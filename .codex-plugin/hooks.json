@@ -32,6 +32,17 @@
           }
         ]
       }
+    ],
+    "SessionEnd": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CODEX_PLUGIN_ROOT}/hooks/mempal-hook.sh session-end"
+          }
+        ]
+      }
     ]
   }
 }

@@ -161,6 +161,30 @@ def _count_human_messages(transcript_path: str) -> int:
     return count
 
 
+def _last_stop_mine_count_path(session_id: str) -> Path:
+    return STATE_DIR / f"{_sanitize_session_id(session_id)}.last_stop_mine_count"
+
+
+def _read_last_stop_mine_count(session_id: str) -> int:
+    try:
+        return int(_last_stop_mine_count_path(session_id).read_text().strip())
+    except (OSError, ValueError):
+        return 0
+
+
+def _write_last_stop_mine_count(session_id: str, count: int) -> None:
+    try:
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        path = _last_stop_mine_count_path(session_id)
+        path.write_text(str(count), encoding="utf-8")
+        try:
+            path.chmod(0o600)
+        except (OSError, NotImplementedError):
+            pass
+    except OSError:
+        pass
+
+
 _state_dir_initialized = False
 
 
@@ -487,18 +511,18 @@ def _save_diary_direct(
     return {"count": 0}
 
 
-def _ingest_transcript(transcript_path: str):
+def _ingest_transcript(transcript_path: str) -> bool:
     """Mine a Claude Code session transcript into the palace as a conversation."""
     path = Path(transcript_path).expanduser()
     if not path.is_file() or path.stat().st_size < 100:
-        return
+        return False
 
     from .config import MempalaceConfig
 
     try:
         MempalaceConfig()  # validate config loads
     except Exception:
-        return
+        return False
 
     try:
         log_path = STATE_DIR / "hook.log"
@@ -529,8 +553,9 @@ def _ingest_transcript(transcript_path: str):
                 stderr=log_f,
             )
         _log(f"Transcript ingest started (cursor mode): {path.name}")
+        return True
     except OSError:
-        pass
+        return False
 
 
 def _spawn_detached_cursor_mine(transcript_path: str) -> None:
@@ -758,14 +783,16 @@ def _wing_from_transcript_path(transcript_path: str) -> str:
 
 
 def hook_stop(data: dict, harness: str):
-    """Stop hook: spawn an incremental cursor mine of the transcript.
+    """Stop hook: periodically spawn an incremental cursor mine of the transcript.
 
-    Single-purpose by design (personal-v3): the only chromadb writer per
-    fire is the spawned `mempalace mine --cursor` subprocess, which takes
-    `mine_palace_lock`. Multiple concurrent fires coordinate cleanly --
-    later spawns get `MineAlreadyRunning` and exit. No diary checkpoint,
-    no synthetic stub, no MEMPAL_DIR ingest -- those produced parallel
-    chromadb writes that raced the mine and corrupted HNSW segments.
+    The hook fires whenever the assistant stops, but mining is gated by
+    SAVE_INTERVAL real user messages per session. The only chromadb writer
+    when the threshold is hit is the spawned `mempalace mine --cursor`
+    subprocess, which takes `mine_palace_lock`. Multiple concurrent fires
+    coordinate cleanly -- later spawns get `MineAlreadyRunning` and exit.
+    No diary checkpoint, no synthetic stub, no MEMPAL_DIR ingest -- those
+    produced parallel chromadb writes that raced the mine and corrupted
+    HNSW segments.
 
     Subagent stops fire the same Stop hook against the parent session's
     transcript; their content is already in the parent transcript and
@@ -776,10 +803,27 @@ def hook_stop(data: dict, harness: str):
         return
 
     parsed = _parse_harness_input(data, harness)
+    session_id = parsed["session_id"]
     transcript_path = parsed["transcript_path"]
 
     if transcript_path:
-        _ingest_transcript(transcript_path)
+        user_message_count = _count_human_messages(transcript_path)
+        last_mined_count = _read_last_stop_mine_count(session_id)
+        if (
+            user_message_count > 0
+            and (user_message_count < last_mined_count or user_message_count - last_mined_count >= SAVE_INTERVAL)
+        ):
+            _log(
+                f"STOP threshold reached for session {session_id}: "
+                f"{user_message_count} user messages ({user_message_count - last_mined_count} since last mine)"
+            )
+            if _ingest_transcript(transcript_path):
+                _write_last_stop_mine_count(session_id, user_message_count)
+        else:
+            _log(
+                f"STOP threshold not reached for session {session_id}: "
+                f"{user_message_count} user messages ({user_message_count - last_mined_count} since last mine)"
+            )
 
     _output({})
 

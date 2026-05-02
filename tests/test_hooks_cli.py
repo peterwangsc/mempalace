@@ -217,17 +217,33 @@ def test_stop_hook_no_transcript_no_mine(tmp_path):
     mock_ingest.assert_not_called()
 
 
-def test_stop_hook_spawns_cursor_mine(tmp_path):
-    """personal-v3 simplification: hook_stop's only chromadb writer per
-    fire is the spawned ``mempalace mine --cursor`` subprocess. No diary
-    checkpoint, no synthetic stub, no MEMPAL_DIR ingest. Asserts
-    _ingest_transcript fires exactly once with the transcript path; no
-    other writers are invoked.
+def test_stop_hook_below_threshold_no_mine(tmp_path):
+    """Stop fires every assistant stop, but only mines every SAVE_INTERVAL
+    real user messages.
     """
     transcript = tmp_path / "t.jsonl"
     _write_transcript(
         transcript,
         [{"message": {"role": "user", "content": f"msg {i}"}} for i in range(3)],
+    )
+    with patch("mempalace.hooks_cli._ingest_transcript") as mock_ingest:
+        result = _capture_hook_output(
+            hook_stop,
+            {"session_id": "test", "stop_hook_active": False, "transcript_path": str(transcript)},
+            state_dir=tmp_path,
+        )
+    assert result == {}
+    mock_ingest.assert_not_called()
+
+
+def test_stop_hook_spawns_cursor_mine_at_threshold(tmp_path):
+    """At SAVE_INTERVAL real user messages, Stop spawns the cursor mine and
+    does not invoke any other chromadb writers.
+    """
+    transcript = tmp_path / "t.jsonl"
+    _write_transcript(
+        transcript,
+        [{"message": {"role": "user", "content": f"msg {i}"}} for i in range(SAVE_INTERVAL)],
     )
     with (
         patch("mempalace.hooks_cli._ingest_transcript") as mock_ingest,
@@ -245,6 +261,26 @@ def test_stop_hook_spawns_cursor_mine(tmp_path):
     mock_save.assert_not_called()
     mock_stub.assert_not_called()
     mock_auto.assert_not_called()
+
+
+def test_stop_hook_mines_once_per_interval(tmp_path):
+    transcript = tmp_path / "t.jsonl"
+    _write_transcript(
+        transcript,
+        [{"message": {"role": "user", "content": f"msg {i}"}} for i in range(SAVE_INTERVAL)],
+    )
+    with patch("mempalace.hooks_cli._ingest_transcript") as mock_ingest:
+        _capture_hook_output(
+            hook_stop,
+            {"session_id": "test", "transcript_path": str(transcript)},
+            state_dir=tmp_path,
+        )
+        _capture_hook_output(
+            hook_stop,
+            {"session_id": "test", "transcript_path": str(transcript)},
+            state_dir=tmp_path,
+        )
+    mock_ingest.assert_called_once_with(str(transcript))
 
 
 # --- hook_session_start ---
@@ -883,17 +919,13 @@ def test_validate_transcript_accepts_platform_native_path(tmp_path):
 
 
 def test_stop_hook_ignores_stop_hook_active(tmp_path):
-    """personal-v3 simplification: hook_stop no longer branches on
-    stop_hook_active. The cursor mine is idempotent and incremental, so
-    firing on every stop -- including stops where the legacy code would
-    have passed through -- is cheap and safe. This also closes the
-    injection vector where a malicious stop_hook_active string could
-    suppress saves.
+    """stop_hook_active is ignored for control flow, so a malicious string
+    cannot suppress a thresholded mine.
     """
     transcript = tmp_path / "t.jsonl"
     _write_transcript(
         transcript,
-        [{"message": {"role": "user", "content": f"msg {i}"}} for i in range(3)],
+        [{"message": {"role": "user", "content": f"msg {i}"}} for i in range(SAVE_INTERVAL)],
     )
     with patch("mempalace.hooks_cli._ingest_transcript") as mock_ingest:
         _capture_hook_output(
@@ -906,5 +938,3 @@ def test_stop_hook_ignores_stop_hook_active(tmp_path):
             state_dir=tmp_path,
         )
     mock_ingest.assert_called_once_with(str(transcript))
-
-
