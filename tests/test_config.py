@@ -148,9 +148,19 @@ def test_sanitize_name_cyrillic():
     assert sanitize_name("Алексей") == "Алексей"
 
 
-def test_sanitize_name_rejects_leading_underscore():
-    with pytest.raises(ValueError):
-        sanitize_name("_foo")
+def test_sanitize_name_accepts_leading_underscore():
+    assert sanitize_name("_foo") == "_foo"
+
+
+def test_sanitize_name_accepts_canonical_wing():
+    assert (
+        sanitize_name("_users_peterwang_code_playground_abg_one")
+        == "_users_peterwang_code_playground_abg_one"
+    )
+
+
+def test_sanitize_name_accepts_short_canonical_wing():
+    assert sanitize_name("_sessions") == "_sessions"
 
 
 def test_sanitize_name_rejects_path_traversal():
