@@ -758,123 +758,30 @@ def _wing_from_transcript_path(transcript_path: str) -> str:
 
 
 def hook_stop(data: dict, harness: str):
-    """Stop hook: block every N messages for auto-save."""
-    # Subagent stops fire the same Stop hook against the parent session's
-    # transcript_path, so a single main-agent turn with N background
-    # subagents produces N+1 firings at identical timestamps. That's
-    # wasted CPU (mine_lock serializes them into identical work) and
-    # noisy logs. Skip subagent stops — their content is already in the
-    # parent transcript and gets ingested by the cursor mine when the
-    # main agent stops.
+    """Stop hook: spawn an incremental cursor mine of the transcript.
+
+    Single-purpose by design (personal-v3): the only chromadb writer per
+    fire is the spawned `mempalace mine --cursor` subprocess, which takes
+    `mine_palace_lock`. Multiple concurrent fires coordinate cleanly --
+    later spawns get `MineAlreadyRunning` and exit. No diary checkpoint,
+    no synthetic stub, no MEMPAL_DIR ingest -- those produced parallel
+    chromadb writes that raced the mine and corrupted HNSW segments.
+
+    Subagent stops fire the same Stop hook against the parent session's
+    transcript; their content is already in the parent transcript and
+    gets ingested when the main agent stops. Skip them.
+    """
     if data.get("agent_id"):
         _output({})
         return
 
     parsed = _parse_harness_input(data, harness)
-    session_id = parsed["session_id"]
-    stop_hook_active = parsed["stop_hook_active"]
     transcript_path = parsed["transcript_path"]
 
-    # If already in a block-mode save cycle, let through (infinite-loop prevention).
-    # Silent mode saves directly without returning {"decision":"block"}, so there's
-    # no loop to prevent — and Claude Code's plugin dispatch sets this flag on every
-    # fire after the first, which would otherwise suppress all subsequent auto-saves.
-    if str(stop_hook_active).lower() in ("true", "1", "yes"):
-        # Safe default: assume silent mode on any config-read failure so saves
-        # proceed rather than being silently dropped. Silent mode is the default
-        # (v3.3.0+), so if we can't read config, behave as if it's still on.
-        silent_guard = True
-        try:
-            from .config import MempalaceConfig
-        except ImportError as exc:
-            _log(
-                f"WARNING: could not import MempalaceConfig for stop guard: {exc}; defaulting to silent mode"
-            )
-        else:
-            try:
-                silent_guard = MempalaceConfig().hook_silent_save
-            except AttributeError as exc:
-                _log(f"WARNING: could not read hook_silent_save: {exc}; defaulting to silent mode")
-        if not silent_guard:
-            _output({})
-            return
+    if transcript_path:
+        _ingest_transcript(transcript_path)
 
-    # Count human messages
-    exchange_count = _count_human_messages(transcript_path)
-
-    # Track last save point
-    STATE_DIR.mkdir(parents=True, exist_ok=True)
-    last_save_file = STATE_DIR / f"{session_id}_last_save"
-    last_save = 0
-    if last_save_file.is_file():
-        try:
-            last_save = int(last_save_file.read_text().strip())
-        except (ValueError, OSError):
-            last_save = 0
-
-    since_last = exchange_count - last_save
-
-    _log(f"Session {session_id}: {exchange_count} exchanges, {since_last} since last save")
-
-    if since_last >= SAVE_INTERVAL and exchange_count > 0:
-        _log(f"TRIGGERING SAVE at exchange {exchange_count}")
-
-        # Read hook settings from config
-        from .config import MempalaceConfig
-
-        try:
-            config = MempalaceConfig()
-            silent = config.hook_silent_save
-            toast = config.hook_desktop_toast
-        except Exception:
-            silent = True
-            toast = False
-
-        project_wing = _wing_from_transcript_path(transcript_path)
-
-        if silent:
-            # Save directly via Python API — systemMessage renders in terminal
-            result = {"count": 0}
-            if transcript_path:
-                result = _save_diary_direct(
-                    transcript_path, session_id, wing=project_wing, toast=toast
-                )
-                _ingest_transcript(transcript_path)
-            _maybe_auto_ingest()
-            # Only advance save marker after successful save
-            count = result.get("count", 0)
-            if count > 0:
-                try:
-                    last_save_file.write_text(str(exchange_count), encoding="utf-8")
-                except OSError:
-                    pass
-                themes = result.get("themes", [])
-                if themes:
-                    tag = " \u2014 " + ", ".join(themes)
-                else:
-                    tag = ""
-                _output(
-                    {
-                        "systemMessage": f"\u2726 {count} memories woven into the palace{tag}",
-                    }
-                )
-            else:
-                _output({})
-        else:
-            # Legacy: block and ask Claude to save via MCP tools.
-            # Marker advances before confirmed save — best-effort; if Claude
-            # fails to save, the checkpoint is lost but won't retry endlessly.
-            try:
-                last_save_file.write_text(str(exchange_count), encoding="utf-8")
-            except OSError:
-                pass
-            if transcript_path:
-                _ingest_transcript(transcript_path)
-            _maybe_auto_ingest()
-            reason = STOP_BLOCK_REASON + f" Write diary entry to wing={project_wing}."
-            _output({"decision": "block", "reason": reason})
-    else:
-        _output({})
+    _output({})
 
 
 def hook_session_start(data: dict, harness: str):
@@ -918,14 +825,15 @@ queries. Example shape (NOT the content):
 
 
 def hook_precompact(data: dict, harness: str):
-    """Precompact hook: mine transcript, override compaction prompt to
-    output recovery search queries instead of a prose summary.
+    """Precompact hook: spawn an incremental cursor mine of the transcript,
+    then override compaction's default summary prompt with one that emits
+    mempalace_search recovery queries (the verbatim is already in the
+    palace, so a prose summary would be redundant).
 
-    The verbatim transcript is already captured in the palace by
-    _ingest_transcript before compaction runs, so the compaction summary
-    is redundant. We replace it with 3-5 distinctive search queries — a
-    breadcrumb the next session can use to find the verbatim content
-    back via mempalace_search.
+    Single-purpose by design (personal-v3): only the spawned cursor mine
+    writes to chromadb. The previous design also did MEMPAL_DIR sync mine
+    + a synthetic SessionEnd stub upsert — those produced parallel writes
+    that raced the spawned miner and corrupted HNSW segments.
     """
     parsed = _parse_harness_input(data, harness)
     session_id = parsed["session_id"]
@@ -933,24 +841,8 @@ def hook_precompact(data: dict, harness: str):
 
     _log(f"PRE-COMPACT triggered for session {session_id}")
 
-    # Capture tool output via our normalize path before compaction loses it
     if transcript_path:
         _ingest_transcript(transcript_path)
-
-    # Mine MEMPAL_DIR synchronously so project data lands before
-    # compaction proceeds. Transcript convos were already kicked off
-    # above via _ingest_transcript.
-    _mine_sync()
-
-    # Stub-on-precompact: write a minimal SessionEnd-style stub so even
-    # if the user /clears immediately after /compact (skipping
-    # SessionEnd entirely on some harnesses), this session has at
-    # least one discoverable marker. The cursor-aware _ingest_transcript
-    # above already captured the verbatim tail; the stub is the
-    # narrative breadcrumb.
-    cwd = str(data.get("cwd", "") or "")
-    if _write_session_end_stub(session_id, transcript_path, "precompact", cwd):
-        _log(f"PRE-COMPACT stub written for session {session_id}")
 
     _output({"newCustomInstructions": PRECOMPACT_CUSTOM_INSTRUCTIONS})
 
@@ -959,15 +851,13 @@ def hook_session_end(data: dict, harness: str):
     """SessionEnd hook: fires on /clear, /logout, prompt-input-exit, etc.
 
     Hard 1.5s budget in Claude Code (overridable via
-    CLAUDE_CODE_SESSIONEND_HOOKS_TIMEOUT_MS). We do two cheap things:
+    CLAUDE_CODE_SESSIONEND_HOOKS_TIMEOUT_MS). Single-purpose by design
+    (personal-v3): spawn the cursor mine in a *detached* process group
+    so it survives Claude Code's teardown reaping, and return.
 
-      1. Write a synthetic diary stub directly via the palace API —
-         pure Python, well under the budget. This is the bare-minimum
-         marker that survives /clear; without it, short sessions
-         disappear entirely from MemPalace.
-      2. Spawn the cursor mine in a *detached* process group so it
-         survives Claude Code's teardown reaping. The mine itself can
-         take seconds; it just runs after the session is gone.
+    The previous design also wrote a synthetic stub directly via the
+    palace API — that's a parallel chromadb write that raced the
+    detached miner and corrupted HNSW segments.
 
     SessionEnd never blocks — there's no AI left to respond.
     """
@@ -977,10 +867,6 @@ def hook_session_end(data: dict, harness: str):
     reason = str(data.get("reason", "") or "unknown")
 
     _log(f"SESSION-END triggered for session {session_id} reason={reason}")
-
-    cwd = str(data.get("cwd", "") or "")
-    if _write_session_end_stub(session_id, transcript_path, reason, cwd):
-        _log(f"SESSION-END stub written for session {session_id}")
 
     _spawn_detached_cursor_mine(transcript_path)
 

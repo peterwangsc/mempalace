@@ -205,86 +205,46 @@ def test_stop_hook_passthrough_when_active_string(tmp_path):
     assert result == {}
 
 
-def test_stop_hook_passthrough_below_interval(tmp_path):
-    transcript = tmp_path / "t.jsonl"
-    _write_transcript(
-        transcript,
-        [{"message": {"role": "user", "content": f"msg {i}"}} for i in range(SAVE_INTERVAL - 1)],
-    )
-    result = _capture_hook_output(
-        hook_stop,
-        {"session_id": "test", "stop_hook_active": False, "transcript_path": str(transcript)},
-        state_dir=tmp_path,
-    )
+def test_stop_hook_no_transcript_no_mine(tmp_path):
+    """Empty transcript_path skips the cursor mine entirely."""
+    with patch("mempalace.hooks_cli._ingest_transcript") as mock_ingest:
+        result = _capture_hook_output(
+            hook_stop,
+            {"session_id": "test", "stop_hook_active": False, "transcript_path": ""},
+            state_dir=tmp_path,
+        )
     assert result == {}
+    mock_ingest.assert_not_called()
 
 
-def test_stop_hook_saves_silently_at_interval(tmp_path):
+def test_stop_hook_spawns_cursor_mine(tmp_path):
+    """personal-v3 simplification: hook_stop's only chromadb writer per
+    fire is the spawned ``mempalace mine --cursor`` subprocess. No diary
+    checkpoint, no synthetic stub, no MEMPAL_DIR ingest. Asserts
+    _ingest_transcript fires exactly once with the transcript path; no
+    other writers are invoked.
+    """
     transcript = tmp_path / "t.jsonl"
     _write_transcript(
         transcript,
-        [{"message": {"role": "user", "content": f"msg {i}"}} for i in range(SAVE_INTERVAL)],
+        [{"message": {"role": "user", "content": f"msg {i}"}} for i in range(3)],
     )
-    save_result = {"count": 15, "themes": ["hooks", "notifications"]}
-    with patch("mempalace.hooks_cli._save_diary_direct", return_value=save_result) as mock_save:
+    with (
+        patch("mempalace.hooks_cli._ingest_transcript") as mock_ingest,
+        patch("mempalace.hooks_cli._save_diary_direct") as mock_save,
+        patch("mempalace.hooks_cli._write_session_end_stub") as mock_stub,
+        patch("mempalace.hooks_cli._maybe_auto_ingest") as mock_auto,
+    ):
         result = _capture_hook_output(
             hook_stop,
             {"session_id": "test", "stop_hook_active": False, "transcript_path": str(transcript)},
             state_dir=tmp_path,
         )
-    # Saves silently — systemMessage notification with themes, no block
-    assert result["systemMessage"].startswith("\u2726 15 memories woven into the palace")
-    assert "hooks" in result["systemMessage"]
-    # Wing is derived from the transcript's parent directory via the canonical
-    # `normalize_wing_name` convention (commit 671a976). For a tmp_path-based
-    # transcript the wing is the normalized form of the tmp dir name — compute
-    # it the same way the production code does so the test stays portable.
-    expected_wing = _wing_from_transcript_path(str(transcript))
-    mock_save.assert_called_once_with(str(transcript), "test", wing=expected_wing, toast=False)
-
-
-def test_stop_hook_derives_wing_from_transcript_path(tmp_path):
-    """When transcript path looks like a Claude Code path, wing is derived from it."""
-    project_dir = tmp_path / ".claude" / "projects" / "-home-jp-Projects-myproject"
-    project_dir.mkdir(parents=True)
-    transcript = project_dir / "session.jsonl"
-    _write_transcript(
-        transcript,
-        [{"message": {"role": "user", "content": f"msg {i}"}} for i in range(SAVE_INTERVAL)],
-    )
-    save_result = {"count": 15, "themes": []}
-    with patch("mempalace.hooks_cli._save_diary_direct", return_value=save_result) as mock_save:
-        _capture_hook_output(
-            hook_stop,
-            {"session_id": "test", "stop_hook_active": False, "transcript_path": str(transcript)},
-            state_dir=tmp_path,
-        )
-    # Canonical wing for parent dir `-home-jp-Projects-myproject` is
-    # `_home_jp_projects_myproject` (normalize_wing_name applied to parent.name).
-    mock_save.assert_called_once_with(
-        str(transcript), "test", wing="_home_jp_projects_myproject", toast=False
-    )
-
-
-def test_stop_hook_tracks_save_point(tmp_path):
-    transcript = tmp_path / "t.jsonl"
-    _write_transcript(
-        transcript,
-        [{"message": {"role": "user", "content": f"msg {i}"}} for i in range(SAVE_INTERVAL)],
-    )
-    data = {"session_id": "test", "stop_hook_active": False, "transcript_path": str(transcript)}
-
-    # First call saves silently with systemMessage notification
-    save_result = {"count": 15, "themes": ["hooks"]}
-    with patch("mempalace.hooks_cli._save_diary_direct", return_value=save_result):
-        result = _capture_hook_output(hook_stop, data, state_dir=tmp_path)
-    assert "systemMessage" in result
-
-    # Second call with same count passes through (already saved)
-    with patch("mempalace.hooks_cli._save_diary_direct") as mock_save:
-        result = _capture_hook_output(hook_stop, data, state_dir=tmp_path)
     assert result == {}
+    mock_ingest.assert_called_once_with(str(transcript))
     mock_save.assert_not_called()
+    mock_stub.assert_not_called()
+    mock_auto.assert_not_called()
 
 
 # --- hook_session_start ---
@@ -722,90 +682,26 @@ def test_parse_harness_input_valid():
 # --- hook_stop with OSError on write ---
 
 
-def test_stop_hook_oserror_on_last_save_read(tmp_path):
-    """When last_save_file has invalid content, falls back to 0."""
-    transcript = tmp_path / "t.jsonl"
-    _write_transcript(
-        transcript,
-        [{"message": {"role": "user", "content": f"msg {i}"}} for i in range(SAVE_INTERVAL)],
-    )
-    # Write invalid content to last save file
-    (tmp_path / "test_last_save").write_text("not_a_number")
-    save_result = {"count": 15, "themes": ["testing"]}
-    with patch("mempalace.hooks_cli._save_diary_direct", return_value=save_result):
-        result = _capture_hook_output(
-            hook_stop,
-            {"session_id": "test", "stop_hook_active": False, "transcript_path": str(transcript)},
-            state_dir=tmp_path,
-        )
-    assert "systemMessage" in result
-    assert "15 memories" in result["systemMessage"]
-
-
-def test_stop_hook_oserror_on_write(tmp_path):
-    """When write to last_save_file fails, hook still outputs correctly."""
-    transcript = tmp_path / "t.jsonl"
-    _write_transcript(
-        transcript,
-        [{"message": {"role": "user", "content": f"msg {i}"}} for i in range(SAVE_INTERVAL)],
-    )
-
-    def bad_write_text(*args, **kwargs):
-        raise OSError("disk full")
-
-    save_result = {"count": 15, "themes": []}
-    with patch("mempalace.hooks_cli.STATE_DIR", tmp_path):
-        with patch("mempalace.hooks_cli._save_diary_direct", return_value=save_result):
-            with patch.object(Path, "write_text", bad_write_text):
-                result = _capture_hook_output(
-                    hook_stop,
-                    {
-                        "session_id": "test",
-                        "stop_hook_active": False,
-                        "transcript_path": str(transcript),
-                    },
-                    state_dir=tmp_path,
-                )
-    assert "systemMessage" in result
-
-
 # --- hook_precompact with MEMPAL_DIR ---
 
 
-def test_precompact_with_mempal_dir(tmp_path):
-    """Precompact runs subprocess.run (sync) when MEMPAL_DIR is set."""
-    from mempalace.hooks_cli import PRECOMPACT_CUSTOM_INSTRUCTIONS
-
-    mempal_dir = tmp_path / "project"
-    mempal_dir.mkdir()
-    with patch.dict("os.environ", {"MEMPAL_DIR": str(mempal_dir)}):
-        with patch("mempalace.hooks_cli.subprocess.run") as mock_run:
-            result = _capture_hook_output(
-                hook_precompact,
-                {"session_id": "test"},
-                state_dir=tmp_path,
-            )
-    assert result == {"newCustomInstructions": PRECOMPACT_CUSTOM_INSTRUCTIONS}
-    mock_run.assert_called_once()
-
-
-def test_precompact_with_mempal_dir_oserror(tmp_path):
-    """Precompact handles OSError from subprocess gracefully — still emits
-    the customInstructions override even when the project mine errored,
-    because the verbatim transcript is captured separately and the prose
-    summary remains redundant either way."""
-    from mempalace.hooks_cli import PRECOMPACT_CUSTOM_INSTRUCTIONS
-
-    mempal_dir = tmp_path / "project"
-    mempal_dir.mkdir()
-    with patch.dict("os.environ", {"MEMPAL_DIR": str(mempal_dir)}):
-        with patch("mempalace.hooks_cli.subprocess.run", side_effect=OSError("fail")):
-            result = _capture_hook_output(
-                hook_precompact,
-                {"session_id": "test"},
-                state_dir=tmp_path,
-            )
-    assert result == {"newCustomInstructions": PRECOMPACT_CUSTOM_INSTRUCTIONS}
+def test_precompact_does_not_run_mine_sync(tmp_path):
+    """personal-v3 simplification: hook_precompact no longer runs
+    _mine_sync. Only the spawned cursor mine writes to chromadb.
+    """
+    with (
+        patch("mempalace.hooks_cli._ingest_transcript") as mock_ingest,
+        patch("mempalace.hooks_cli._mine_sync") as mock_sync,
+        patch("mempalace.hooks_cli._write_session_end_stub") as mock_stub,
+    ):
+        _capture_hook_output(
+            hook_precompact,
+            {"session_id": "test", "transcript_path": "/tmp/x.jsonl"},
+            state_dir=tmp_path,
+        )
+    mock_ingest.assert_called_once_with("/tmp/x.jsonl")
+    mock_sync.assert_not_called()
+    mock_stub.assert_not_called()
 
 
 def test_precompact_with_timeout(tmp_path):
@@ -986,21 +882,20 @@ def test_validate_transcript_accepts_platform_native_path(tmp_path):
     assert result.is_file()
 
 
-def test_stop_hook_rejects_injected_stop_hook_active(tmp_path):
-    """stop_hook_active with shell injection string should not cause pass-through.
-
-    Verifies the injected value is not treated as truthy — the save path runs
-    instead of being short-circuited. Mocks _save_diary_direct so we can assert
-    it was invoked regardless of silent vs legacy save mode.
+def test_stop_hook_ignores_stop_hook_active(tmp_path):
+    """personal-v3 simplification: hook_stop no longer branches on
+    stop_hook_active. The cursor mine is idempotent and incremental, so
+    firing on every stop -- including stops where the legacy code would
+    have passed through -- is cheap and safe. This also closes the
+    injection vector where a malicious stop_hook_active string could
+    suppress saves.
     """
     transcript = tmp_path / "t.jsonl"
     _write_transcript(
         transcript,
-        [{"message": {"role": "user", "content": f"msg {i}"}} for i in range(SAVE_INTERVAL)],
+        [{"message": {"role": "user", "content": f"msg {i}"}} for i in range(3)],
     )
-    with patch(
-        "mempalace.hooks_cli._save_diary_direct", return_value={"count": 1, "themes": []}
-    ) as mock_save:
+    with patch("mempalace.hooks_cli._ingest_transcript") as mock_ingest:
         _capture_hook_output(
             hook_stop,
             {
@@ -1010,6 +905,6 @@ def test_stop_hook_rejects_injected_stop_hook_active(tmp_path):
             },
             state_dir=tmp_path,
         )
-    # The injected value is not "true"/"1"/"yes", so the hook should NOT pass through.
-    # Save must have been attempted.
-    assert mock_save.called
+    mock_ingest.assert_called_once_with(str(transcript))
+
+
