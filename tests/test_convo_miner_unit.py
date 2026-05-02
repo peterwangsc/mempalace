@@ -1,8 +1,11 @@
 """Unit tests for convo_miner pure functions (no chromadb needed)."""
 
 import contextlib
+import json
 
 from mempalace.convo_miner import (
+    _derive_wing_for_file,
+    _extract_codex_cwd,
     _file_chunks_locked,
     chunk_exchanges,
     detect_convo_room,
@@ -114,6 +117,69 @@ class TestScanConvos:
     def test_scan_empty_dir(self, tmp_path):
         files = scan_convos(str(tmp_path))
         assert files == []
+
+
+class TestWingDerivation:
+    def test_codex_session_uses_session_meta_cwd(self, tmp_path):
+        root = tmp_path / "sessions"
+        session_dir = root / "2026" / "05" / "02"
+        session_dir.mkdir(parents=True)
+        transcript = session_dir / "rollout.jsonl"
+        transcript.write_text(
+            "\n".join(
+                [
+                    json.dumps(
+                        {
+                            "type": "session_meta",
+                            "payload": {"cwd": "/Users/peterwang/code/playground/mempalace"},
+                        }
+                    ),
+                    json.dumps(
+                        {
+                            "type": "event_msg",
+                            "payload": {"type": "user_message", "message": "hi"},
+                        }
+                    ),
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        assert _extract_codex_cwd(transcript) == "/Users/peterwang/code/playground/mempalace"
+        assert (
+            _derive_wing_for_file(transcript, root, None)
+            == "_users_peterwang_code_playground_mempalace"
+        )
+
+    def test_codex_session_without_cwd_falls_back_to_directory(self, tmp_path):
+        root = tmp_path / "sessions"
+        session_dir = root / "2026" / "05" / "02"
+        session_dir.mkdir(parents=True)
+        transcript = session_dir / "rollout.jsonl"
+        transcript.write_text(
+            json.dumps({"type": "session_meta", "payload": {}}) + "\n",
+            encoding="utf-8",
+        )
+
+        assert _derive_wing_for_file(transcript, root, None) == "2026"
+
+    def test_explicit_wing_still_wins_for_codex_session(self, tmp_path):
+        root = tmp_path / "sessions"
+        transcript = root / "rollout.jsonl"
+        transcript.parent.mkdir(parents=True)
+        transcript.write_text(
+            json.dumps(
+                {
+                    "type": "session_meta",
+                    "payload": {"cwd": "/Users/peterwang/code/playground/mempalace"},
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        assert _derive_wing_for_file(transcript, root, "manual_wing") == "manual_wing"
 
 
 class TestFileChunksLocked:

@@ -17,6 +17,7 @@ from datetime import datetime
 from collections import defaultdict
 from typing import Optional
 
+from .config import normalize_wing_name
 from .normalize import normalize
 from .palace import (
     NORMALIZE_VERSION,
@@ -1010,17 +1011,54 @@ def _report_dry_run_chunks(filepath: Path, chunks: list, room, extract_mode: str
 
 def _sanitize_wing_name(name: str) -> str:
     """Normalize a directory name into a wing identifier."""
-    return name.lower().replace(" ", "_").replace("-", "_")
+    return normalize_wing_name(name)
+
+
+def _extract_codex_cwd(filepath: Path) -> Optional[str]:
+    """Return session_meta.payload.cwd from a Codex CLI transcript."""
+    if filepath.suffix.lower() != ".jsonl":
+        return None
+    try:
+        with open(filepath, encoding="utf-8", errors="replace") as f:
+            for i, line in enumerate(f):
+                if i >= 20:
+                    break
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(entry, dict) or entry.get("type") != "session_meta":
+                    continue
+                payload = entry.get("payload", {})
+                if not isinstance(payload, dict):
+                    return None
+                cwd = payload.get("cwd")
+                return cwd if isinstance(cwd, str) and cwd else None
+    except OSError:
+        return None
+    return None
+
+
+def _wing_from_cwd(cwd: str) -> str:
+    """Convert a real cwd path into the canonical path-derived wing."""
+    encoded = Path(cwd).as_posix().replace("/", "-")
+    return normalize_wing_name(encoded)
 
 
 def _derive_wing_for_file(filepath: Path, convo_path: Path, override: str) -> str:
     """Return the wing name for a convo file mined under convo_path.
 
     If --wing was explicitly passed, `override` wins for every file (caller
-    wants a single wing). Otherwise: if the file lives in a subdirectory
-    of convo_path, the wing comes from that subdirectory's name; if the
-    file is directly in convo_path, the wing comes from convo_path's
-    name (the original behavior).
+    wants a single wing). Otherwise: Codex CLI transcripts under
+    ~/.codex/sessions derive from session_meta.payload.cwd so they land in
+    the same path-based wing as Claude Code/project mining. For other
+    layouts, if the file lives in a subdirectory of convo_path, the wing
+    comes from that subdirectory's name; if the file is directly in
+    convo_path, the wing comes from convo_path's name (the original
+    behavior).
 
     Rationale: `mempalace mine ~/.claude/projects --mode convos` should
     produce one wing per project slug, not dump every transcript from
@@ -1030,6 +1068,9 @@ def _derive_wing_for_file(filepath: Path, convo_path: Path, override: str) -> st
     """
     if override:
         return override
+    codex_cwd = _extract_codex_cwd(filepath)
+    if codex_cwd:
+        return _wing_from_cwd(codex_cwd)
     try:
         rel = filepath.relative_to(convo_path)
     except ValueError:
