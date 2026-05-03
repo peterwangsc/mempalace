@@ -1180,18 +1180,35 @@ class ChromaBackend(BaseBackend):
         self._client(palace_path).delete_collection(collection_name)
 
     def create_collection(
-        self, palace_path: str, collection_name: str, hnsw_space: str = "cosine"
+        self,
+        palace_path: str,
+        collection_name: str,
+        hnsw_space: str = "cosine",
+        metadata_overrides: Optional[dict] = None,
     ) -> ChromaCollection:
-        """Create (not get-or-create) ``collection_name`` with the given HNSW space."""
+        """Create (not get-or-create) ``collection_name`` with the given HNSW space.
+
+        ``metadata_overrides`` lets a caller replace specific HNSW params
+        (e.g. ``hnsw:sync_threshold``) for workloads where the default
+        ``_HNSW_BLOAT_GUARD`` is wrong. Bulk-rebuilds in particular MUST
+        override the 50_000 sync_threshold: the guard is sized for
+        incremental writes and leaves the trailing buffer between the
+        last flush and end-of-write unflushed on a one-shot rebuild,
+        silently dropping up to ~50_000 records from the persistent
+        index.
+        """
         ef = self._resolve_embedding_function()
         ef_kwargs = {"embedding_function": ef} if ef is not None else {}
+        metadata = {
+            "hnsw:space": hnsw_space,
+            "hnsw:num_threads": 1,
+            **_hnsw_metadata_for(collection_name),
+        }
+        if metadata_overrides:
+            metadata.update(metadata_overrides)
         collection = self._client(palace_path).create_collection(
             collection_name,
-            metadata={
-                "hnsw:space": hnsw_space,
-                "hnsw:num_threads": 1,
-                **_hnsw_metadata_for(collection_name),
-            },
+            metadata=metadata,
             **ef_kwargs,
         )
         return ChromaCollection(collection)

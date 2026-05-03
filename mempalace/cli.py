@@ -656,7 +656,9 @@ def cmd_repair(args):
         os.path.expanduser(args.palace) if args.palace else MempalaceConfig().palace_path
     )
 
-    if getattr(args, "mode", "legacy") == "max-seq-id":
+    mode = getattr(args, "mode", "legacy")
+
+    if mode == "max-seq-id":
         from .repair import repair_max_seq_id
 
         repair_max_seq_id(
@@ -666,6 +668,16 @@ def cmd_repair(args):
             backup=getattr(args, "backup", True),
             dry_run=getattr(args, "dry_run", False),
             assume_yes=getattr(args, "yes", False),
+        )
+        return
+
+    if mode == "flush-trailing-buffer":
+        from .repair import recover_unflushed_buffer
+
+        recover_unflushed_buffer(
+            palace_path,
+            flush_threshold=getattr(args, "flush_threshold", 100),
+            restore_threshold=not getattr(args, "no_restore_threshold", False),
         )
         return
 
@@ -754,7 +766,19 @@ def cmd_repair(args):
 
     print("  Rebuilding collection...")
     backend.delete_collection(palace_path, "mempalace_drawers")
-    new_col = backend.create_collection(palace_path, "mempalace_drawers")
+    # Override the bloat guard for this rebuild — see comment in
+    # mempalace.repair.rebuild_index. The 50_000 sync_threshold strands
+    # up to ~50_000 records past the last flush boundary on a one-shot
+    # bulk rebuild; 1_000 keeps flushes frequent without re-introducing
+    # the resize-cycle bloat the guard exists to prevent.
+    new_col = backend.create_collection(
+        palace_path,
+        "mempalace_drawers",
+        metadata_overrides={
+            "hnsw:batch_size": 1_000,
+            "hnsw:sync_threshold": 1_000,
+        },
+    )
 
     filed = 0
     for i in range(0, len(all_ids), batch_size):
@@ -765,7 +789,28 @@ def cmd_repair(args):
         filed += len(batch_ids)
         print(f"  Re-filed {filed}/{len(all_ids)} drawers...")
 
+    # Post-rebuild reconciliation: chromadb's add() returns success
+    # even when the persistent HNSW silently fails to flush. Cross-check
+    # the new segment's hnsw_capacity_status against ``filed`` and
+    # refuse to declare success if diverged. The backup at
+    # ``backup_path`` is preserved for manual restore.
+    from .backends.chroma import hnsw_capacity_status
+
+    cap = hnsw_capacity_status(palace_path, "mempalace_drawers")
+    hnsw_count = cap.get("hnsw_count")
+    if cap.get("diverged") or (hnsw_count is not None and abs(hnsw_count - filed) > 1_000):
+        print(
+            f"\n  ERROR: post-rebuild HNSW divergence — "
+            f"expected {filed:,}, HNSW reports {hnsw_count}, "
+            f"sqlite={cap.get('sqlite_count')}."
+        )
+        print(f"  Pre-repair backup preserved at: {backup_path}")
+        print("  Try `mempalace repair --mode flush-trailing-buffer` to drain the queue,")
+        print("  or restore manually from the backup directory.")
+        return
+
     print(f"\n  Repair complete. {filed} drawers rebuilt.")
+    print(f"  HNSW verification: hnsw={hnsw_count:,}, sqlite={cap.get('sqlite_count'):,}.")
     print(f"  Backup saved at {backup_path}")
     print(f"\n{'=' * 55}\n")
 
@@ -1436,11 +1481,33 @@ def main():
     )
     p_repair.add_argument(
         "--mode",
-        choices=["legacy", "max-seq-id"],
+        choices=["legacy", "max-seq-id", "flush-trailing-buffer"],
         default="legacy",
         help=(
             "legacy: full-palace rebuild (default). "
-            "max-seq-id: un-poison max_seq_id rows corrupted by the legacy 0.6.x shim."
+            "max-seq-id: un-poison max_seq_id rows corrupted by the legacy 0.6.x shim. "
+            "flush-trailing-buffer: drain queue-stranded records into HNSW in place "
+            "(use after a pre-fix repair that left up to ~50_000 records unflushed)."
+        ),
+    )
+    p_repair.add_argument(
+        "--flush-threshold",
+        type=int,
+        default=100,
+        help=(
+            "(--mode flush-trailing-buffer only) "
+            "HNSW sync_threshold/batch_size to use during the drain (default 100). "
+            "Lower = more frequent flush, slower drain. "
+            "Higher = fewer flushes, may strand a small trailing window."
+        ),
+    )
+    p_repair.add_argument(
+        "--no-restore-threshold",
+        action="store_true",
+        help=(
+            "(--mode flush-trailing-buffer only) "
+            "Skip restoring the original sync_threshold after draining. Leave the "
+            "low threshold in place so future incremental writes also flush promptly."
         ),
     )
     p_repair.add_argument(

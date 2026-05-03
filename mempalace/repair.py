@@ -405,10 +405,25 @@ def rebuild_index(palace_path=None, confirm_truncation_ok: bool = False):
         shutil.copy2(sqlite_path, backup_path)
         print(f"  Backup: {backup_path}")
 
-    # Rebuild with correct HNSW settings
+    # Rebuild with correct HNSW settings.
+    #
+    # ``metadata_overrides`` overrides the ``_HNSW_BLOAT_GUARD`` defaults
+    # (sync_threshold=50_000, batch_size=50_000). The bloat guard exists
+    # to prevent resize-cycle bloat under incremental writes; on a
+    # one-shot bulk rebuild it instead leaves the trailing buffer
+    # between the last 50k flush boundary and ``len(all_ids)`` unflushed,
+    # silently stranding up to ~50k records in ``embeddings_queue``.
+    # 1_000 keeps flush frequency moderate without re-introducing bloat.
     print("  Rebuilding collection with hnsw:space=cosine...")
     backend.delete_collection(palace_path, COLLECTION_NAME)
-    new_col = backend.create_collection(palace_path, COLLECTION_NAME)
+    new_col = backend.create_collection(
+        palace_path,
+        COLLECTION_NAME,
+        metadata_overrides={
+            "hnsw:batch_size": 1_000,
+            "hnsw:sync_threshold": 1_000,
+        },
+    )
 
     filed = 0
     try:
@@ -431,7 +446,29 @@ def rebuild_index(palace_path=None, confirm_truncation_ok: bool = False):
             print("  No backup available. Re-mine from source files to recover.")
         raise
 
+    # ── Post-rebuild verification ─────────────────────────────────────
+    # ChromaDB's upsert returns success even when the persistent HNSW
+    # silently fails to flush (the original bug class this fix targets).
+    # Cross-check the new segment's ``hnsw_capacity_status`` against
+    # ``len(all_ids)`` and refuse to declare success if diverged. The
+    # backup copy of the OLD chroma.sqlite3 is preserved at
+    # ``backup_path`` so the operator can restore manually.
+    cap = hnsw_capacity_status(palace_path, COLLECTION_NAME)
+    hnsw_count = cap.get("hnsw_count")
+    if cap.get("diverged") or (hnsw_count is not None and abs(hnsw_count - filed) > 1_000):
+        print(
+            f"\n  ERROR: post-rebuild HNSW divergence detected — "
+            f"expected {filed:,}, HNSW reports {hnsw_count}. "
+            f"sqlite={cap.get('sqlite_count')}."
+        )
+        print(f"  Backup of pre-repair chroma.sqlite3 preserved at: {backup_path}")
+        print("  To restore: stop any running mempalace process, then")
+        print(f"    cp {backup_path} {sqlite_path}")
+        print("  Investigate chromadb's HNSW flush behavior before retrying.")
+        return
+
     print(f"\n  Repair complete. {filed} drawers rebuilt.")
+    print(f"  HNSW verification: hnsw={hnsw_count:,}, sqlite={cap.get('sqlite_count'):,}.")
     print("  HNSW index is now clean with cosine distance metric.")
     print(f"\n{'=' * 55}\n")
 
@@ -735,6 +772,187 @@ def repair_max_seq_id(
     print(f"  Backup:  {result['backup'] or '(skipped)'}")
     print(f"\n{'=' * 55}\n")
     return result
+
+
+# ---------------------------------------------------------------------------
+# flush-trailing-buffer mode: drain unflushed records into HNSW in place
+# ---------------------------------------------------------------------------
+
+
+def recover_unflushed_buffer(
+    palace_path: Optional[str] = None,
+    *,
+    flush_threshold: int = 100,
+    restore_threshold: bool = True,
+) -> dict:
+    """Drain a queue-stranded HNSW segment without a full rebuild.
+
+    Symptom: ``repair-status`` reports DIVERGED with a fixed gap that
+    doesn't shrink across MCP server restarts. The drawers segment's
+    ``max_seq_id`` row trails ``embeddings_queue.max(seq_id)`` by the
+    exact gap size, and ``index_metadata.pickle.total_elements_added``
+    is stuck at the last 50_000-multiple record count (e.g. 100_000
+    out of 142_172).
+
+    Cause: ``_HNSW_BLOAT_GUARD`` sets ``hnsw:sync_threshold=50_000`` on
+    the drawers collection. When a bulk write (e.g. ``mempalace repair``
+    pre-fix) ends at a count that is not a multiple of 50_000, the
+    trailing buffer between the last flush and end-of-write sits in
+    ``embeddings_queue`` indefinitely. The chromadb consumer pulls from
+    the queue only when its in-memory ``_curr_batch`` reaches
+    ``batch_size``; with batch_size=50_000, queues holding <50_000
+    pending records never drain on reopen.
+
+    Recovery is two-session:
+      1. Open the collection, modify ``hnsw:sync_threshold`` and
+         ``hnsw:batch_size`` to ``flush_threshold`` (default 100).
+         ``modify()`` persists the new config to chroma.sqlite3 but the
+         in-memory segment instance keeps its old config.
+      2. Close. Reopen the palace. The segment instance reloads with
+         the new low thresholds. Its ``_backfill`` consumes the queue
+         and flushes within ``flush_threshold`` records per batch,
+         draining the trailing buffer into HNSW.
+      3. Verify by re-reading the segment pickle.
+      4. Optionally (default on) restore the original sync_threshold so
+         the bloat guard remains in place for steady-state operation.
+
+    No data is destroyed by this routine. The only mutation is to the
+    drawers collection's HNSW config (which we restore on exit) and
+    HNSW persisting records that ``submit_embeddings`` already accepted.
+    """
+    palace_path = palace_path or _get_palace_path()
+    palace_path = os.path.abspath(os.path.expanduser(palace_path))
+
+    print(f"\n{'=' * 55}")
+    print("  MemPalace Repair — Flush Trailing Buffer")
+    print(f"{'=' * 55}\n")
+    print(f"  Palace:           {palace_path}")
+    print(f"  Flush threshold:  {flush_threshold}")
+    print(f"  Restore on exit:  {restore_threshold}")
+
+    if not os.path.isdir(palace_path):
+        print(f"  No palace at {palace_path}")
+        return {"aborted": True, "reason": "palace-missing"}
+
+    before = hnsw_capacity_status(palace_path, COLLECTION_NAME)
+    print(
+        f"\n  Before:  sqlite={before.get('sqlite_count')}  "
+        f"hnsw={before.get('hnsw_count')}  "
+        f"divergence={before.get('divergence')}  "
+        f"status={before.get('status')}"
+    )
+    if not before.get("diverged"):
+        print("  Already converged — nothing to flush.")
+        return {"aborted": False, "before": before, "after": before, "noop": True}
+
+    # ── Session A: lower thresholds via modify() ──────────────────────
+    backend = ChromaBackend()
+    print("\n  Session A: lowering hnsw:sync_threshold & hnsw:batch_size...")
+    try:
+        col = backend.get_collection(palace_path, COLLECTION_NAME)
+    except Exception as e:
+        print(f"  Could not open collection: {e}")
+        return {"aborted": True, "reason": "open-failed"}
+
+    try:
+        col._collection.modify(
+            configuration={
+                "hnsw": {
+                    "sync_threshold": flush_threshold,
+                    "batch_size": flush_threshold,
+                }
+            }
+        )
+    except Exception as e:
+        print(f"  modify() failed: {e}")
+        return {"aborted": True, "reason": "modify-failed"}
+
+    # Drop client + chromadb singleton caches so the next get_collection
+    # reads the freshly written config from sqlite instead of reusing
+    # the in-memory segment with stale thresholds.
+    _close_chroma_handles(palace_path)
+    print("  Session A: complete. Closed handles.")
+
+    # ── Session B: reopen so the segment reloads with new thresholds ──
+    # Touch the collection once via a count() call. This forces
+    # segment lazy-init, which subscribes to embeddings_queue and
+    # backfills the pending records. With batch_size=flush_threshold,
+    # _apply_batch fires every flush_threshold records and persists.
+    print("\n  Session B: reopening to drain queue...")
+    backend = ChromaBackend()
+    try:
+        col = backend.get_collection(palace_path, COLLECTION_NAME)
+        live_count = col.count()
+        print(f"  col.count()={live_count}")
+    except Exception as e:
+        print(f"  reopen failed: {e}")
+        return {"aborted": True, "reason": "reopen-failed"}
+
+    # Force a final flush by adding+deleting a single nudge record. The
+    # nudge runs through submit_embeddings → _notify_one →
+    # _write_records → _apply_batch, which crosses the (low) batch_size
+    # threshold and persists. We pass a synthetic embedding so we don't
+    # need to invoke the embedding function.
+    import numpy as np
+
+    nudge_id = "_recover_unflushed_buffer_nudge"
+    # Pull dimensionality from an existing record's metadata if we can;
+    # else fall back to 384 (sentence-transformers default), since the
+    # nudge is deleted immediately and dim only needs to match for the
+    # add-then-delete cycle to succeed.
+    dim = 384
+    try:
+        sample = col._collection.get(limit=1, include=["embeddings"])
+        if sample and sample.get("embeddings") and len(sample["embeddings"]) > 0:
+            emb = sample["embeddings"][0]
+            if emb is not None:
+                dim = len(emb)
+    except Exception:
+        pass
+    rng = np.random.default_rng(0)
+    nudge_emb = rng.standard_normal(dim).astype("float32").tolist()
+
+    try:
+        col._collection.add(ids=[nudge_id], embeddings=[nudge_emb])
+        col._collection.delete(ids=[nudge_id])
+        print(f"  Nudge cycle complete (dim={dim}).")
+    except Exception as e:
+        print(f"  Nudge failed (continuing): {e}")
+
+    _close_chroma_handles(palace_path)
+
+    after = hnsw_capacity_status(palace_path, COLLECTION_NAME)
+    print(
+        f"\n  After:   sqlite={after.get('sqlite_count')}  "
+        f"hnsw={after.get('hnsw_count')}  "
+        f"divergence={after.get('divergence')}  "
+        f"status={after.get('status')}"
+    )
+
+    # ── Optional Session C: restore the original sync_threshold ───────
+    if restore_threshold:
+        print("\n  Session C: restoring sync_threshold to bloat-guard default...")
+        try:
+            from .backends.chroma import _hnsw_metadata_for
+
+            guard = _hnsw_metadata_for(COLLECTION_NAME)
+            backend2 = ChromaBackend()
+            col2 = backend2.get_collection(palace_path, COLLECTION_NAME)
+            col2._collection.modify(
+                configuration={
+                    "hnsw": {
+                        "sync_threshold": guard["hnsw:sync_threshold"],
+                        "batch_size": guard["hnsw:batch_size"],
+                    }
+                }
+            )
+            print(f"  Restored: {guard}")
+            _close_chroma_handles(palace_path)
+        except Exception as e:
+            print(f"  Restore failed (recovery succeeded; rerun with --no-restore-threshold to skip): {e}")
+
+    print(f"\n{'=' * 55}\n")
+    return {"aborted": False, "before": before, "after": after, "noop": False}
 
 
 if __name__ == "__main__":
