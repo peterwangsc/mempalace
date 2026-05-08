@@ -784,6 +784,7 @@ def recover_unflushed_buffer(
     *,
     flush_threshold: int = 100,
     restore_threshold: bool = True,
+    quiet: bool = False,
 ) -> dict:
     """Drain a queue-stranded HNSW segment without a full rebuild.
 
@@ -822,6 +823,10 @@ def recover_unflushed_buffer(
     """
     palace_path = palace_path or _get_palace_path()
     palace_path = os.path.abspath(os.path.expanduser(palace_path))
+
+    if quiet:
+        def print(*_a, **_k):  # noqa: A001 — deliberate local shadow for quiet mode
+            return None
 
     print(f"\n{'=' * 55}")
     print("  MemPalace Repair — Flush Trailing Buffer")

@@ -28,29 +28,32 @@ _REQUIRED_OPERATORS = frozenset({"$eq", "$ne", "$in", "$nin", "$and", "$or", "$c
 _OPTIONAL_OPERATORS = frozenset({"$gt", "$gte", "$lt", "$lte"})
 _SUPPORTED_OPERATORS = _REQUIRED_OPERATORS | _OPTIONAL_OPERATORS
 
-# HNSW tuning to prevent link_lists.bin bloat on large mines (#344).
+# HNSW tuning. Two competing failure modes shape the choice:
 #
-# With default params (batch_size=100, sync_threshold=1000, initial capacity
-# 1000), inserting tens of thousands of drawers triggers ~30 index resizes
-# and hundreds of persistDirty() calls. persistDirty uses relative seek
-# positioning in link_lists.bin; accumulated seek drift across resize cycles
-# causes the OS to extend the sparse file with zero-filled regions, each
-# cycle compounding the next. Result: link_lists.bin grows into hundreds of
-# GB sparse, after which `status`/`search`/`repair` segfault.
+#   1. link_lists.bin sparse-bloat on large mines (#344). Pre-content-
+#      addressed-ID palaces re-inserted the same position-derived IDs on
+#      every re-mine; each re-insert triggered a persistDirty() seek-drift
+#      cycle, growing link_lists.bin into hundreds of GB sparse, eventually
+#      segfaulting. The original guard pushed batch_size=50_000 to defer
+#      persistence past the resize-cycle window.
 #
-# Setting large batch and sync thresholds at collection creation defers
-# persistence until a single large batch completes, breaking the resize+
-# persist feedback loop. Empirically validated on a 39,792-drawer rebuild
-# (palace 376 MB, link_lists.bin 0 bytes, no segfault) in 2026-04.
+#   2. embeddings_queue stranding under incremental writes. ChromaDB's
+#      consumer pulls from the queue only when its in-memory _curr_batch
+#      reaches batch_size. With batch_size=50_000, any write that adds
+#      fewer pending records than that — every Stop-hook ingest, every
+#      small mine — sits in the queue forever. The 16k-drawer divergence
+#      we observe in steady-state hook traffic is exactly this.
 #
-# Note: chromadb 1.5.x exposes a `collection.modify(configuration={"hnsw":
-# {"batch_size": ..., "sync_threshold": ...}})` retrofit path for already-
-# created collections (`UpdateHNSWConfiguration` in chromadb's API), but
-# this PR doesn't pursue that — once link_lists.bin has bloated, the index
-# is already corrupt and the only known recovery is a fresh mine.
+# Content-addressed drawer IDs (commit 324d363, NORMALIZE_VERSION 3)
+# closed the duplicate-re-insert path that drove failure mode #1: today's
+# upserts hash deterministically and don't churn the resize cycle.
+# Lowering the guard to 1_000 keeps a flush cadence the queue compactor
+# can actually reach under hook-driven writes. Existing palaces baked at
+# 50_000 retrofit on the next cold-start auto-drain (see
+# _maybe_auto_drain_unflushed_queue).
 _HNSW_BLOAT_GUARD = {
-    "hnsw:batch_size": 50_000,
-    "hnsw:sync_threshold": 50_000,
+    "hnsw:batch_size": 1_000,
+    "hnsw:sync_threshold": 1_000,
 }
 
 # Small-collection variant of the bloat guard. Closets and other indexes
@@ -555,6 +558,51 @@ def hnsw_capacity_status(palace_path: str, collection_name: str = "mempalace_dra
         logger.debug("hnsw_capacity_status failed", exc_info=True)
         out["message"] = "HNSW capacity probe raised; skipping"
     return out
+
+
+# Divergence above this is no longer queue stranding — it's a missing
+# segment binary, a deleted/quarantined directory, or post-truncation
+# corruption. Auto-drain can't help; explicit ``mempalace repair`` is
+# the correct response. Kept loosely aligned with the historical
+# bloat-guard ceiling (50_000) so the gap on a freshly-baked
+# pre-content-addressed-ID palace never auto-recovers silently.
+_AUTO_DRAIN_MAX_DIVERGENCE = 50_000
+
+
+def _maybe_auto_drain_unflushed_queue(palace_path: str) -> None:
+    """Drain a queue-stranded drawers segment if probe shows stranding.
+
+    Cold-start companion to ``quarantine_stale_hnsw``. Where quarantine
+    handles "the segment file is corrupt", this handles "the segment is
+    fine but ChromaDB's queue compactor never reached batch_size and
+    stranded the trailing buffer in embeddings_queue". See
+    :func:`mempalace.repair.recover_unflushed_buffer` for the cause.
+
+    Conservative gating: fires only when ``hnsw_capacity_status``
+    reports diverged with ``0 < divergence < _AUTO_DRAIN_MAX_DIVERGENCE``.
+    Larger gaps are usually structural (missing segment, post-truncation,
+    cross-machine replica drift) and need explicit repair.
+
+    Best-effort: any failure is logged at DEBUG and swallowed. The
+    caller still gets a working client — auto-drain is a healing
+    optimization, not a correctness gate.
+    """
+    try:
+        cap = hnsw_capacity_status(palace_path, "mempalace_drawers")
+    except Exception:
+        logger.debug("auto-drain probe raised on %s", palace_path, exc_info=True)
+        return
+    if not cap.get("diverged"):
+        return
+    divergence = cap.get("divergence") or 0
+    if divergence <= 0 or divergence >= _AUTO_DRAIN_MAX_DIVERGENCE:
+        return
+    try:
+        from ..repair import recover_unflushed_buffer
+
+        recover_unflushed_buffer(palace_path, quiet=True)
+    except Exception:
+        logger.debug("auto-drain failed on %s", palace_path, exc_info=True)
 
 
 def _sqlite_embedding_count(palace_path: str, collection_name: str) -> Optional[int]:
@@ -1065,6 +1113,15 @@ class ChromaBackend(BaseBackend):
     # safety property; locking would add cost without correctness gain.
     _quarantined_paths: set[str] = set()
 
+    # Per-process record of palaces where we've already attempted a queue
+    # auto-drain. Set BEFORE invoking the drain so reentrant
+    # ChromaBackend calls (recover_unflushed_buffer opens its own
+    # collection mid-flow) hit the marker and skip rather than recurse.
+    # Idempotent at the operation level — the drain no-ops on a converged
+    # palace — so a missed marker would only cost latency, never
+    # correctness.
+    _auto_drained_paths: set[str] = set()
+
     @staticmethod
     def make_client(palace_path: str):
         """Create a fresh ``PersistentClient`` (fixes BLOB seq_ids first).
@@ -1076,12 +1133,20 @@ class ChromaBackend(BaseBackend):
         Quarantines stale HNSW segments **once per palace per process**. See
         :attr:`_quarantined_paths` for the rationale (cold-start protection
         vs. runtime thrash on steady-write daemons).
+
+        Also drains a queue-stranded HNSW segment once per palace per
+        process when ``hnsw_capacity_status`` reports stranding-shaped
+        divergence. See :func:`_maybe_auto_drain_unflushed_queue`.
         """
         _fix_blob_seq_ids(palace_path)
         if palace_path not in ChromaBackend._quarantined_paths:
             quarantine_stale_hnsw(palace_path)
             ChromaBackend._quarantined_paths.add(palace_path)
-        return chromadb.PersistentClient(path=palace_path)
+        client = chromadb.PersistentClient(path=palace_path)
+        if palace_path not in ChromaBackend._auto_drained_paths:
+            ChromaBackend._auto_drained_paths.add(palace_path)
+            _maybe_auto_drain_unflushed_queue(palace_path)
+        return client
 
     @staticmethod
     def backend_version() -> str:
