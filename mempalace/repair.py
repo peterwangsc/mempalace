@@ -824,39 +824,38 @@ def recover_unflushed_buffer(
     palace_path = palace_path or _get_palace_path()
     palace_path = os.path.abspath(os.path.expanduser(palace_path))
 
-    if quiet:
-        def print(*_a, **_k):  # noqa: A001 — deliberate local shadow for quiet mode
-            return None
+    import builtins
+    _print = (lambda *_a, **_k: None) if quiet else builtins.print
 
-    print(f"\n{'=' * 55}")
-    print("  MemPalace Repair — Flush Trailing Buffer")
-    print(f"{'=' * 55}\n")
-    print(f"  Palace:           {palace_path}")
-    print(f"  Flush threshold:  {flush_threshold}")
-    print(f"  Restore on exit:  {restore_threshold}")
+    _print(f"\n{'=' * 55}")
+    _print("  MemPalace Repair — Flush Trailing Buffer")
+    _print(f"{'=' * 55}\n")
+    _print(f"  Palace:           {palace_path}")
+    _print(f"  Flush threshold:  {flush_threshold}")
+    _print(f"  Restore on exit:  {restore_threshold}")
 
     if not os.path.isdir(palace_path):
-        print(f"  No palace at {palace_path}")
+        _print(f"  No palace at {palace_path}")
         return {"aborted": True, "reason": "palace-missing"}
 
     before = hnsw_capacity_status(palace_path, COLLECTION_NAME)
-    print(
+    _print(
         f"\n  Before:  sqlite={before.get('sqlite_count')}  "
         f"hnsw={before.get('hnsw_count')}  "
         f"divergence={before.get('divergence')}  "
         f"status={before.get('status')}"
     )
     if not before.get("diverged"):
-        print("  Already converged — nothing to flush.")
+        _print("  Already converged — nothing to flush.")
         return {"aborted": False, "before": before, "after": before, "noop": True}
 
     # ── Session A: lower thresholds via modify() ──────────────────────
     backend = ChromaBackend()
-    print("\n  Session A: lowering hnsw:sync_threshold & hnsw:batch_size...")
+    _print("\n  Session A: lowering hnsw:sync_threshold & hnsw:batch_size...")
     try:
         col = backend.get_collection(palace_path, COLLECTION_NAME)
     except Exception as e:
-        print(f"  Could not open collection: {e}")
+        _print(f"  Could not open collection: {e}")
         return {"aborted": True, "reason": "open-failed"}
 
     try:
@@ -869,28 +868,28 @@ def recover_unflushed_buffer(
             }
         )
     except Exception as e:
-        print(f"  modify() failed: {e}")
+        _print(f"  modify() failed: {e}")
         return {"aborted": True, "reason": "modify-failed"}
 
     # Drop client + chromadb singleton caches so the next get_collection
     # reads the freshly written config from sqlite instead of reusing
     # the in-memory segment with stale thresholds.
     _close_chroma_handles(palace_path)
-    print("  Session A: complete. Closed handles.")
+    _print("  Session A: complete. Closed handles.")
 
     # ── Session B: reopen so the segment reloads with new thresholds ──
     # Touch the collection once via a count() call. This forces
     # segment lazy-init, which subscribes to embeddings_queue and
     # backfills the pending records. With batch_size=flush_threshold,
     # _apply_batch fires every flush_threshold records and persists.
-    print("\n  Session B: reopening to drain queue...")
+    _print("\n  Session B: reopening to drain queue...")
     backend = ChromaBackend()
     try:
         col = backend.get_collection(palace_path, COLLECTION_NAME)
         live_count = col.count()
-        print(f"  col.count()={live_count}")
+        _print(f"  col.count()={live_count}")
     except Exception as e:
-        print(f"  reopen failed: {e}")
+        _print(f"  reopen failed: {e}")
         return {"aborted": True, "reason": "reopen-failed"}
 
     # Force a final flush by adding+deleting a single nudge record. The
@@ -920,14 +919,14 @@ def recover_unflushed_buffer(
     try:
         col._collection.add(ids=[nudge_id], embeddings=[nudge_emb])
         col._collection.delete(ids=[nudge_id])
-        print(f"  Nudge cycle complete (dim={dim}).")
+        _print(f"  Nudge cycle complete (dim={dim}).")
     except Exception as e:
-        print(f"  Nudge failed (continuing): {e}")
+        _print(f"  Nudge failed (continuing): {e}")
 
     _close_chroma_handles(palace_path)
 
     after = hnsw_capacity_status(palace_path, COLLECTION_NAME)
-    print(
+    _print(
         f"\n  After:   sqlite={after.get('sqlite_count')}  "
         f"hnsw={after.get('hnsw_count')}  "
         f"divergence={after.get('divergence')}  "
@@ -936,7 +935,7 @@ def recover_unflushed_buffer(
 
     # ── Optional Session C: restore the original sync_threshold ───────
     if restore_threshold:
-        print("\n  Session C: restoring sync_threshold to bloat-guard default...")
+        _print("\n  Session C: restoring sync_threshold to bloat-guard default...")
         try:
             from .backends.chroma import _hnsw_metadata_for
 
@@ -951,12 +950,12 @@ def recover_unflushed_buffer(
                     }
                 }
             )
-            print(f"  Restored: {guard}")
+            _print(f"  Restored: {guard}")
             _close_chroma_handles(palace_path)
         except Exception as e:
-            print(f"  Restore failed (recovery succeeded; rerun with --no-restore-threshold to skip): {e}")
+            _print(f"  Restore failed (recovery succeeded; rerun with --no-restore-threshold to skip): {e}")
 
-    print(f"\n{'=' * 55}\n")
+    _print(f"\n{'=' * 55}\n")
     return {"aborted": False, "before": before, "after": after, "noop": False}
 
 
