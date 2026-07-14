@@ -232,44 +232,119 @@ def test_capacity_status_flags_unflushed_with_large_sqlite(tmp_path):
     assert "never flushed" in info["message"]
 
 
-def test_capacity_status_pickle_absent_but_binary_present_reports_ok(tmp_path):
-    """Pickle absent + populated ``data_level0.bin`` is the post-#1103-
-    workaround state: the corrupt ``dimensionality: None`` pickle has
-    been deleted and chromadb's Rust loader falls through to the binary
-    HNSW. Vector search works; the probe must NOT flag this as DIVERGED.
+def _materialize_segment(
+    palace: str, segment_id: str, data_bytes: int, length_elements: int | None
+) -> str:
+    """Create a segment dir with data_level0.bin and optionally length.bin."""
+    seg_dir = os.path.join(palace, segment_id)
+    os.makedirs(seg_dir, exist_ok=True)
+    with open(os.path.join(seg_dir, "data_level0.bin"), "wb") as f:
+        f.write(b"\x00" * data_bytes)
+    if length_elements is not None:
+        with open(os.path.join(seg_dir, "length.bin"), "wb") as f:
+            f.write(b"\x00" * (4 * length_elements))
+    return seg_dir
 
-    Reproduces the live state of Peter's drawers segment after we
-    applied the #1103 workaround on 2026-04-29: pickle deleted,
-    ``data_level0.bin`` ~255 MB, chromadb count() and query() both
-    succeed via the binary path. ``repair-status`` previously reported
-    DIVERGED here because ``_hnsw_element_count`` returned None and the
-    heuristic only saw "no pickle + sqlite >> threshold". The new
-    behavior treats the populated-binary case as loadable, displays
-    sqlite_count as the assumed count (the binary mirrors sqlite state
-    by virtue of being loadable), and includes a note pointing at the
-    documented workaround so a future maintainer doesn't mistake this
-    for a corruption signal.
+
+def test_capacity_status_pickle_absent_estimates_from_length_bin(tmp_path):
+    """Pickle absent + populated binary: estimate the count from length.bin.
+
+    The old heuristic trusted ``data_level0.bin``'s mere presence and
+    reported sqlite_count as the HNSW count. Disproven 2026-07-14:
+    chromadb 1.5.7 recreates an *empty* index over a pickle-less segment
+    (the "delete the corrupt pickle" #1103 workaround destroyed a
+    182k-vector index), and the heuristic reported the emptied segment
+    as a healthy full one. length.bin stores 4 bytes per added element,
+    so its size is a real count signal that survives the pickle's
+    absence.
     """
     seg = "seg-pickle-deleted"
     _seed_chroma_db(str(tmp_path), sqlite_count=132_275, segment_id=seg)
-
-    # Materialize the segment dir with a non-empty data_level0.bin and
-    # NO pickle — exactly the post-workaround on-disk shape.
-    seg_dir = os.path.join(str(tmp_path), seg)
-    os.makedirs(seg_dir, exist_ok=True)
-    with open(os.path.join(seg_dir, "data_level0.bin"), "wb") as f:
-        f.write(b"\x00" * 200_000)
+    _materialize_segment(str(tmp_path), seg, data_bytes=200_000, length_elements=132_275)
 
     info = hnsw_capacity_status(str(tmp_path), COLLECTION)
     assert info["status"] == "ok", info
     assert info["diverged"] is False
-    assert info["hnsw_count"] == 132_275, (
-        "displayed count should fall back to sqlite_count when the binary "
-        "segment is loadable but the pickle is absent"
-    )
+    assert info["hnsw_count"] == 132_275
     assert info["divergence"] == 0
-    assert "pickle absent" in info["message"].lower()
-    assert "loadable" in info["message"].lower()
+    assert "length.bin" in info["message"]
+
+
+def test_capacity_status_flags_empty_replacement_index(tmp_path):
+    """The 2026-07-14 incident shape: a fresh empty index recreated over a
+    formerly-full segment (167 KB binary, 100-slot length.bin) while
+    sqlite still holds the full corpus. Must report DIVERGED, not the
+    false OK the presence-based heuristic produced.
+    """
+    seg = "seg-emptied"
+    _seed_chroma_db(str(tmp_path), sqlite_count=10_000, segment_id=seg)
+    _materialize_segment(str(tmp_path), seg, data_bytes=167_600, length_elements=100)
+
+    info = hnsw_capacity_status(str(tmp_path), COLLECTION)
+    assert info["status"] == "diverged", info
+    assert info["diverged"] is True
+    assert info["hnsw_count"] == 100
+    assert "repair" in info["message"].lower()
+
+
+def test_capacity_status_pickle_absent_no_length_bin_is_unverifiable(tmp_path):
+    """Binary present but neither pickle nor length.bin: the count cannot
+    be verified. Past the absolute threshold, assume the worst and flag
+    diverged rather than reporting a fabricated OK.
+    """
+    seg = "seg-unverifiable"
+    _seed_chroma_db(str(tmp_path), sqlite_count=10_000, segment_id=seg)
+    _materialize_segment(str(tmp_path), seg, data_bytes=200_000, length_elements=None)
+
+    info = hnsw_capacity_status(str(tmp_path), COLLECTION)
+    assert info["diverged"] is True
+    assert "unverifiable" in info["message"]
+
+
+def test_dimensionality_none_pickle_is_normal_on_157(tmp_path):
+    """``dimensionality: None`` in the pickle is chromadb 1.5.7's normal
+    flush output, NOT a corruption signal — verified 2026-07-14 against
+    a pickle chroma itself wrote for a healthy collection. Guard against
+    reintroducing a detector keyed on it (the April #1103 diagnosis was
+    version-specific); the probe must judge such a segment purely on
+    element counts.
+    """
+    seg = "seg-dim-none"
+    _seed_chroma_db(str(tmp_path), sqlite_count=1_000, segment_id=seg)
+    pickle_path = os.path.join(str(tmp_path), seg)
+    os.makedirs(pickle_path, exist_ok=True)
+    state = {
+        "dimensionality": None,
+        "total_elements_added": 995,
+        "max_seq_id": None,
+        "id_to_label": {f"d-{i}": i for i in range(995)},
+        "label_to_id": {i: f"d-{i}" for i in range(995)},
+        "id_to_seq_id": {},
+    }
+    with open(os.path.join(pickle_path, "index_metadata.pickle"), "wb") as f:
+        pickle.dump(state, f, pickle.HIGHEST_PROTOCOL)
+
+    info = hnsw_capacity_status(str(tmp_path), COLLECTION)
+    assert info["status"] == "ok", info
+    assert info["diverged"] is False
+    assert info["hnsw_count"] == 995
+
+
+def test_auto_drain_fires_on_clean_stranding(tmp_path, monkeypatch):
+    """Control: same divergence band with a healthy pickle still drains."""
+    from mempalace.backends.chroma import _maybe_auto_drain_unflushed_queue
+    import mempalace.repair as repair_mod
+
+    seg = "seg-clean-drain"
+    _seed_chroma_db(str(tmp_path), sqlite_count=6_000, segment_id=seg)
+    _write_pickle(str(tmp_path), seg, hnsw_count=1_000)
+
+    calls: list[str] = []
+    monkeypatch.setattr(
+        repair_mod, "recover_unflushed_buffer", lambda *a, **k: calls.append("fired")
+    )
+    _maybe_auto_drain_unflushed_queue(str(tmp_path))
+    assert calls == ["fired"]
 
 
 def test_capacity_status_pickle_absent_with_empty_data_file_still_skips(tmp_path):

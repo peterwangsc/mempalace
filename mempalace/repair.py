@@ -467,8 +467,11 @@ def rebuild_index(palace_path=None, confirm_truncation_ok: bool = False):
         print("  Investigate chromadb's HNSW flush behavior before retrying.")
         return
 
+    hnsw_display = f"{hnsw_count:,}" if hnsw_count is not None else "unverified"
+    sqlite_count = cap.get("sqlite_count")
+    sqlite_display = f"{sqlite_count:,}" if sqlite_count is not None else "unknown"
     print(f"\n  Repair complete. {filed} drawers rebuilt.")
-    print(f"  HNSW verification: hnsw={hnsw_count:,}, sqlite={cap.get('sqlite_count'):,}.")
+    print(f"  HNSW verification: hnsw={hnsw_display}, sqlite={sqlite_display}.")
     print("  HNSW index is now clean with cosine distance metric.")
     print(f"\n{'=' * 55}\n")
 
@@ -825,6 +828,7 @@ def recover_unflushed_buffer(
     palace_path = os.path.abspath(os.path.expanduser(palace_path))
 
     import builtins
+
     _print = (lambda *_a, **_k: None) if quiet else builtins.print
 
     _print(f"\n{'=' * 55}")
@@ -953,7 +957,9 @@ def recover_unflushed_buffer(
             _print(f"  Restored: {guard}")
             _close_chroma_handles(palace_path)
         except Exception as e:
-            _print(f"  Restore failed (recovery succeeded; rerun with --no-restore-threshold to skip): {e}")
+            _print(
+                f"  Restore failed (recovery succeeded; rerun with --no-restore-threshold to skip): {e}"
+            )
 
     _print(f"\n{'=' * 55}\n")
     return {"aborted": False, "before": before, "after": after, "noop": False}

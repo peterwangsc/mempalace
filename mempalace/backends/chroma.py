@@ -422,6 +422,28 @@ def _hnsw_element_count(palace_path: str, segment_id: str) -> Optional[int]:
         return None
 
 
+def _hnsw_length_bin_estimate(palace_path: str, segment_id: str) -> Optional[int]:
+    """Estimate the HNSW element count from ``length.bin`` (4 bytes/element).
+
+    hnswlib's ``length.bin`` stores one uint32 per added element, so its
+    size tracks ``total_elements_added`` (verified against production
+    pickles: 729,356 bytes / 4 = 182,339 = the pickle's count). Used when
+    the pickle is absent, where trusting ``data_level0.bin``'s mere
+    presence proved wrong: chromadb 1.5.7 recreates an *empty* index
+    (167 KB binary, 400-byte length.bin) over a segment whose pickle was
+    deleted, and the old heuristic reported it as a healthy full index.
+
+    Upper bound of the live count when elements were deleted; fine for
+    divergence detection, which only cares about sqlite >> hnsw.
+    """
+    path = os.path.join(palace_path, segment_id, "length.bin")
+    try:
+        size = os.path.getsize(path) if os.path.isfile(path) else 0
+    except OSError:
+        return None
+    return size // 4 if size > 0 else None
+
+
 # Divergence threshold: chromadb's HNSW flushes asynchronously, so HNSW
 # typically lags sqlite by up to ``sync_threshold`` (default 1000) records
 # under active write load — that's the *brute-force batch* that hasn't
@@ -482,18 +504,18 @@ def hnsw_capacity_status(palace_path: str, collection_name: str = "mempalace_dra
         hnsw_count = _hnsw_element_count(palace_path, seg_id)
         out["hnsw_count"] = hnsw_count
 
+        note = ""
         if hnsw_count is None:
             # No pickle. Three sub-cases distinguished by what's on disk:
             #
-            #  A) Segment dir exists with non-empty ``data_level0.bin``: the
-            #     binary HNSW is loadable. chromadb's Rust path skips a
-            #     missing pickle and loads directly from the binary — that's
-            #     the documented workaround for the dimensionality=None
-            #     pickle bug (mempalace#1103 / chromadb null-deref on
-            #     count()). Vector search works; this is NOT divergence,
-            #     just an unflushed pickle. Use ``sqlite_count`` as the
-            #     displayed count because the binary mirrors sqlite state
-            #     by virtue of being loadable.
+            #  A) Segment dir exists with non-empty ``data_level0.bin``:
+            #     estimate the element count from ``length.bin`` and run
+            #     the normal divergence math. We previously trusted the
+            #     binary's presence and reported sqlite_count as the HNSW
+            #     count ("binary loadable" heuristic) — disproven
+            #     2026-07-14: chromadb 1.5.7 recreates an *empty* index
+            #     over a pickle-less segment, and that heuristic reported
+            #     the emptied 182k-drawer segment as a healthy full one.
             #
             #  B) Segment dir absent or ``data_level0.bin`` empty/missing
             #     AND sqlite holds clearly more than two flush windows
@@ -506,22 +528,33 @@ def hnsw_capacity_status(palace_path: str, collection_name: str = "mempalace_dra
             seg_dir = os.path.join(palace_path, seg_id)
             data_path = os.path.join(seg_dir, "data_level0.bin")
             try:
-                data_size = (
-                    os.path.getsize(data_path) if os.path.isfile(data_path) else 0
-                )
+                data_size = os.path.getsize(data_path) if os.path.isfile(data_path) else 0
             except OSError:
                 data_size = 0
 
-            if data_size > 0:
-                # Sub-case A: binary present, pickle absent.
-                out["hnsw_count"] = sqlite_count
-                out["divergence"] = 0
-                out["status"] = "ok"
-                out["message"] = (
-                    f"HNSW {sqlite_count:,} / sqlite {sqlite_count:,} "
-                    "(pickle absent — binary loadable; common after the "
-                    "#1103 dimensionality=None workaround)"
-                )
+            estimate = _hnsw_length_bin_estimate(palace_path, seg_id) if data_size > 0 else None
+            if estimate is not None:
+                # Sub-case A: binary present, pickle absent — fall through
+                # to the divergence math with the length.bin estimate.
+                hnsw_count = estimate
+                out["hnsw_count"] = estimate
+                note = " (pickle absent — count estimated from length.bin)"
+            elif data_size > 0:
+                # Binary present but no length.bin to estimate from —
+                # element count unverifiable; assume the worst past the
+                # absolute threshold.
+                if sqlite_count > _HNSW_DIVERGENCE_ABSOLUTE:
+                    out["status"] = "diverged"
+                    out["diverged"] = True
+                    out["divergence"] = sqlite_count
+                    out["message"] = (
+                        f"sqlite holds {sqlite_count:,} embeddings but the HNSW "
+                        "segment's pickle is absent and its element count is "
+                        "unverifiable. Run `mempalace repair`."
+                    )
+                else:
+                    out["message"] = "HNSW segment pickle absent and count unverifiable; skipping"
+                return out
             elif sqlite_count > _HNSW_DIVERGENCE_ABSOLUTE:
                 # Sub-case B: existing #1222 behavior unchanged.
                 out["status"] = "diverged"
@@ -532,10 +565,11 @@ def hnsw_capacity_status(palace_path: str, collection_name: str = "mempalace_dra
                     "has never flushed metadata — vector search will return nothing "
                     "until the segment is rebuilt. Run `mempalace repair`."
                 )
+                return out
             else:
                 # Sub-case C: empty/fresh, under threshold.
                 out["message"] = "HNSW segment metadata not yet flushed; skipping"
-            return out
+                return out
 
         divergence = sqlite_count - hnsw_count
         out["divergence"] = divergence
@@ -547,12 +581,12 @@ def hnsw_capacity_status(palace_path: str, collection_name: str = "mempalace_dra
             out["message"] = (
                 f"HNSW index holds {hnsw_count:,} elements but sqlite has "
                 f"{sqlite_count:,} embeddings — {divergence:,} drawers ({pct:.0f}%) "
-                "are invisible to vector search. Run `mempalace repair` to rebuild."
+                f"are invisible to vector search. Run `mempalace repair` to rebuild.{note}"
             )
         else:
             out["status"] = "ok"
             out["message"] = (
-                f"HNSW {hnsw_count:,} / sqlite {sqlite_count:,} (within flush-lag tolerance)"
+                f"HNSW {hnsw_count:,} / sqlite {sqlite_count:,} (within flush-lag tolerance){note}"
             )
     except Exception:
         logger.debug("hnsw_capacity_status failed", exc_info=True)

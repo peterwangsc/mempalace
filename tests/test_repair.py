@@ -7,6 +7,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from mempalace import repair
+from mempalace.backends.chroma import _HNSW_BLOAT_GUARD
 
 
 # ── _get_palace_path ──────────────────────────────────────────────────
@@ -240,7 +241,9 @@ def test_rebuild_index_success(mock_backend_cls, mock_shutil, tmp_path):
 
     # Verify: deleted and recreated (cosine is the backend default)
     mock_backend.delete_collection.assert_called_once_with(str(tmp_path), "mempalace_drawers")
-    mock_backend.create_collection.assert_called_once_with(str(tmp_path), "mempalace_drawers")
+    mock_backend.create_collection.assert_called_once_with(
+        str(tmp_path), "mempalace_drawers", metadata_overrides=_HNSW_BLOAT_GUARD
+    )
 
     # Verify: used upsert not add
     mock_new_col.upsert.assert_called_once()

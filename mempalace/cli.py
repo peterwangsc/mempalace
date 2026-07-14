@@ -310,8 +310,7 @@ def cmd_init(args):
                 )
         except LLMError as e:
             print(
-                f"  LLM init failed ({e}). "
-                f"Running heuristics-only — pass --no-llm to silence this."
+                f"  LLM init failed ({e}). Running heuristics-only — pass --no-llm to silence this."
             )
 
     # Pass 0: detect whether the corpus is AI-dialogue. Writes
@@ -809,8 +808,11 @@ def cmd_repair(args):
         print("  or restore manually from the backup directory.")
         return
 
+    hnsw_display = f"{hnsw_count:,}" if hnsw_count is not None else "unverified"
+    sqlite_count = cap.get("sqlite_count")
+    sqlite_display = f"{sqlite_count:,}" if sqlite_count is not None else "unknown"
     print(f"\n  Repair complete. {filed} drawers rebuilt.")
-    print(f"  HNSW verification: hnsw={hnsw_count:,}, sqlite={cap.get('sqlite_count'):,}.")
+    print(f"  HNSW verification: hnsw={hnsw_display}, sqlite={sqlite_display}.")
     print(f"  Backup saved at {backup_path}")
     print(f"\n{'=' * 55}\n")
 
@@ -976,9 +978,7 @@ def cmd_compress(args):
         print("  (dry run -- nothing stored)")
 
 
-def _backfill_lines_for_source(
-    source, bucket, smart_ctx, build_closet_lines_fn
-):
+def _backfill_lines_for_source(source, bucket, smart_ctx, build_closet_lines_fn):
     """Build closet lines for one source. Returns (lines, wing, room, ingest_mode).
     Extracted from cmd_closets_backfill to stay under ruff's C901 complexity
     limit; no behavior change.
@@ -1015,9 +1015,7 @@ def _backfill_lines_for_source(
             lines = []
     if not lines:
         try:
-            lines = build_closet_lines_fn(
-                source, bucket["ids"], content_joined, wing, room
-            )
+            lines = build_closet_lines_fn(source, bucket["ids"], content_joined, wing, room)
         except Exception:
             return [], wing, room, None
     return lines, wing, room, ingest_mode
@@ -1076,10 +1074,7 @@ def cmd_closets_backfill(args):
         else:
             idf_index = get_or_build_idf_index(palace_path, drawers_col, progress=True)
             smart_ctx = {"idf_index": idf_index, "embedder": embedder}
-            print(
-                f"  Smart closets: n_docs={idf_index['n_docs']}, "
-                f"ngrams={len(idf_index['idf'])}"
-            )
+            print(f"  Smart closets: n_docs={idf_index['n_docs']}, ngrams={len(idf_index['idf'])}")
 
     # Pull all drawers (batched to dodge SQLite parameter limits, mirroring cmd_compress).
     _BATCH = 500
@@ -1167,9 +1162,7 @@ def cmd_closets_backfill(args):
         if args.dry_run:
             continue
 
-        closet_id_base = (
-            f"closet_{wing}_{room}_{hashlib.sha256(source.encode()).hexdigest()[:24]}"
-        )
+        closet_id_base = f"closet_{wing}_{room}_{hashlib.sha256(source.encode()).hexdigest()[:24]}"
         closet_meta = {
             "wing": wing,
             "room": room,
