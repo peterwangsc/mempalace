@@ -11,8 +11,7 @@ import time
 import sys
 
 DB = "file:/Users/peterwang/.mempalace/palace/chroma.sqlite3?mode=ro"
-TARGET = 172_494
-OLD_COLLECTION_ID = "8735b75d-7ba5-4cc5-92bb-e947d75fa96d"
+TARGET = 183_069  # sqlite drawer count at rebuild start, 2026-07-14 01:18
 BAR_WIDTH = 40
 
 
@@ -26,10 +25,8 @@ def rebuilt_count():
             JOIN segments s ON e.segment_id = s.id
             JOIN collections c ON s.collection = c.id
             WHERE c.name = 'mempalace_drawers'
-              AND c.id != ?
               AND s.scope = 'METADATA'
-            """,
-            (OLD_COLLECTION_ID,),
+            """
         ).fetchone()
         return row[0] if row else 0
     finally:
@@ -76,7 +73,7 @@ def main():
 
         if n >= TARGET:
             print("\n\n  Upsert phase complete — the rebuild's final verify/swap may run a bit longer.")
-            print("  Check: tail -5 tmp/rebuild.log  (look for 'REPAIR EXIT: 0')")
+            print("  Check: tail -5 tmp/rebuild-20260714.log  (look for 'Repair complete')")
             break
         time.sleep(5)
 
