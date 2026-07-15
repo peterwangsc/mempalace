@@ -36,3 +36,6 @@ venv/
 
 # ChromaDB local data
 *.sqlite3-journal
+
+# Local scratch — repro cases, one-off scripts, incident artifacts
+tmp/
