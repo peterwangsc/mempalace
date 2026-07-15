@@ -1164,44 +1164,6 @@ def _mine_impl(
             "already-filed drawers are\n  upserted idempotently and will not duplicate.\n"
         )
         sys.exit(130)
-    finally:
-        # Clean up the hooks-side PID lock if it points at us. Stale
-        # entries already pass _pid_alive() == False on POSIX, but
-        # actively removing the file makes the state observable
-        # (callers can stat it) and avoids accidental PID reuse on
-        # short-lived test runs. Only remove if the file claims our
-        # own PID — never another process's.
-        _cleanup_mine_pid_file()
-
-
-def _cleanup_mine_pid_file() -> None:
-    """Remove the global mine PID file if it currently points at us.
-
-    The PID file (``~/.mempalace/hook_state/mine.pid``, written by the
-    hook in :func:`mempalace.hooks_cli._spawn_mine`) tracks the PID of
-    the most recently spawned mine subprocess so the hook can dedup
-    concurrent auto-ingest fires. When that subprocess exits — cleanly,
-    on error, or via Ctrl-C — it should remove its own entry so the
-    next hook fire isn't briefly fooled by a stale PID before
-    ``_pid_alive`` returns False.
-
-    We only delete the file if it claims our own PID; any other PID is
-    left alone (could be an unrelated mine running concurrently from
-    a different worktree / session).
-    """
-    try:
-        from .hooks_cli import _MINE_PID_FILE
-    except Exception:
-        return
-    try:
-        if not _MINE_PID_FILE.exists():
-            return
-        recorded = _MINE_PID_FILE.read_text().strip()
-        if recorded and recorded.isdigit() and int(recorded) == os.getpid():
-            _MINE_PID_FILE.unlink()
-    except OSError:
-        # Best-effort cleanup; never fail the mine over PID bookkeeping.
-        pass
 
 
 def _compute_topic_tunnels_for_wing(wing: str) -> int:

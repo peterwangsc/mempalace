@@ -823,10 +823,33 @@ def recover_unflushed_buffer(
     No data is destroyed by this routine. The only mutation is to the
     drawers collection's HNSW config (which we restore on exit) and
     HNSW persisting records that ``submit_embeddings`` already accepted.
+
+    Holds the cross-process ``palace_write_lock`` for the whole
+    modify→reopen→nudge dance: the raw ``modify``/``add``/``delete``
+    calls bypass the locked ``ChromaCollection`` wrapper, and another
+    process writing mid-dance is the chroma#1584 corruption vector.
     """
     palace_path = palace_path or _get_palace_path()
     palace_path = os.path.abspath(os.path.expanduser(palace_path))
 
+    from .palace_lock import palace_write_lock
+
+    with palace_write_lock(palace_path):
+        return _recover_unflushed_buffer_locked(
+            palace_path,
+            flush_threshold=flush_threshold,
+            restore_threshold=restore_threshold,
+            quiet=quiet,
+        )
+
+
+def _recover_unflushed_buffer_locked(
+    palace_path: str,
+    *,
+    flush_threshold: int,
+    restore_threshold: bool,
+    quiet: bool,
+) -> dict:
     import builtins
 
     _print = (lambda *_a, **_k: None) if quiet else builtins.print

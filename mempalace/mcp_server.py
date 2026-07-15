@@ -293,13 +293,13 @@ def _get_collection(create=False):
                 },
             )
             _pin_hnsw_threads(raw)
-            _collection_cache = ChromaCollection(raw)
+            _collection_cache = ChromaCollection(raw, palace_path=_config.palace_path)
             _metadata_cache = None
             _metadata_cache_time = 0
         elif _collection_cache is None:
             raw = client.get_collection(_config.collection_name)
             _pin_hnsw_threads(raw)
-            _collection_cache = ChromaCollection(raw)
+            _collection_cache = ChromaCollection(raw, palace_path=_config.palace_path)
             _metadata_cache = None
             _metadata_cache_time = 0
         return _collection_cache
@@ -646,7 +646,7 @@ def tool_check_duplicate(content: str, threshold: float = 0.9):
             "vector_disabled": True,
             "vector_disabled_reason": _vector_disabled_reason,
             "hint": (
-                "duplicate detection requires vector search; run " "`mempalace repair` to restore"
+                "duplicate detection requires vector search; run `mempalace repair` to restore"
             ),
         }
     try:
