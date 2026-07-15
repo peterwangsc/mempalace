@@ -131,7 +131,9 @@ def _collection_with_lock(palace_path):
 
     from mempalace.backends.chroma import ChromaCollection
 
-    return ChromaCollection(MagicMock(), palace_path=palace_path), None
+    raw = MagicMock()
+    raw._client._mempalace_gen = ""  # matches the no-gen-file state of a fresh palace
+    return ChromaCollection(raw, palace_path=palace_path), None
 
 
 def test_collection_writes_take_lock(recording_lock, tmp_path):
@@ -157,3 +159,36 @@ def test_collection_without_path_skips_lock(recording_lock):
     col = ChromaCollection(MagicMock())
     col.upsert(documents=["d"], ids=["i"])
     assert recording_lock.entered == 0
+
+
+# ── Cross-process write coherence (generation stamp) ─────────────────
+
+
+def test_write_through_stale_system_refreshes(tmp_path, monkeypatch):
+    """A write generation bumped by another process forces a true client
+    rebuild (SharedSystemClient cache clear) before the next write; writes
+    with no external bump do not rebuild."""
+    import mempalace.backends.chroma as mod
+    from mempalace.backends.chroma import ChromaBackend, _bump_generation
+
+    backend = ChromaBackend()
+    palace = str(tmp_path)
+    col = backend.get_collection(palace, "mempalace_drawers", create=True)
+    col.upsert(ids=["a"], documents=["a"], embeddings=[[0.1] * 4])
+
+    clears = []
+    orig = mod.SharedSystemClient.clear_system_cache
+    monkeypatch.setattr(
+        mod.SharedSystemClient,
+        "clear_system_cache",
+        staticmethod(lambda: (clears.append(1), orig())[1]),
+    )
+
+    _bump_generation(palace)  # simulate another process's write
+    col.upsert(ids=["b"], documents=["b"], embeddings=[[0.2] * 4])
+    assert len(clears) == 1
+
+    col.upsert(ids=["c"], documents=["c"], embeddings=[[0.3] * 4])
+    assert len(clears) == 1  # our own write kept the tag current
+
+    assert col.count() == 3

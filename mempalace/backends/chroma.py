@@ -5,10 +5,12 @@ import datetime as _dt
 import logging
 import os
 import sqlite3
+import uuid
 from pathlib import Path
 from typing import Any, Optional
 
 import chromadb
+from chromadb.api.shared_system_client import SharedSystemClient
 
 from ..palace_lock import palace_write_lock
 
@@ -788,6 +790,38 @@ def _as_list(v: Any) -> list:
     return [v]
 
 
+# Cross-process write coherence. chromadb caches one System per palace path
+# per process (SharedSystemClient), and that System snapshots segment state
+# at construction. palace_write_lock serializes writes, but a serialized
+# write through a System that predates another process's write operates on
+# stale HNSW state and corrupts the segment on disk (2026-07-15 incident;
+# reproduced in tmp/flush_race_repro.py — overlapping writer *lifetimes*
+# corrupt even with every call locked, whole-process-serial writers do not).
+#
+# The stamp file records the palace's write generation. Each System object
+# carries a `_mempalace_gen` tag: the generation it is known to reflect.
+# Writers check tag == disk under the lock and rebuild through
+# clear_system_cache() (the only call that truly discards the cached rust
+# System — a new PersistentClient alone returns the same instance) when
+# stale or unknown.
+_GENERATION_FILE = ".write_generation"
+
+
+def _read_generation(palace_path: str) -> str:
+    try:
+        with open(os.path.join(palace_path, _GENERATION_FILE)) as f:
+            return f.read()
+    except OSError:
+        return ""
+
+
+def _bump_generation(palace_path: str) -> str:
+    token = f"{os.getpid()}-{uuid.uuid4().hex}"
+    with open(os.path.join(palace_path, _GENERATION_FILE), "w") as f:
+        f.write(token)
+    return token
+
+
 class ChromaCollection(BaseCollection):
     """Thin adapter translating ChromaDB dict returns into typed results.
 
@@ -809,6 +843,31 @@ class ChromaCollection(BaseCollection):
             return palace_write_lock(self._palace_path)
         return contextlib.nullcontext()
 
+    def _ensure_fresh(self):
+        """Rebuild the collection through a fresh System if ours is stale.
+
+        Called under the write lock. An untagged System (created by a raw
+        ``PersistentClient`` path) is treated as stale — one redundant
+        rebuild beats one corrupted segment.
+        """
+        path = self._palace_path
+        if not path:
+            return
+        if getattr(self._collection._client, "_mempalace_gen", None) == _read_generation(path):
+            return
+        name = self._collection.name
+        ef = getattr(self._collection, "_embedding_function", None)
+        SharedSystemClient.clear_system_cache()
+        client = chromadb.PersistentClient(path=path)
+        kwargs = {"embedding_function": ef} if ef is not None else {}
+        self._collection = client.get_collection(name, **kwargs)
+        _pin_hnsw_threads(self._collection)
+        self._collection._client._mempalace_gen = _read_generation(path)
+
+    def _mark_written(self):
+        if self._palace_path:
+            self._collection._client._mempalace_gen = _bump_generation(self._palace_path)
+
     # ------------------------------------------------------------------
     # Writes
     # ------------------------------------------------------------------
@@ -820,7 +879,9 @@ class ChromaCollection(BaseCollection):
         if embeddings is not None:
             kwargs["embeddings"] = embeddings
         with self._write_lock():
+            self._ensure_fresh()
             self._collection.add(**kwargs)
+            self._mark_written()
 
     def upsert(self, *, documents, ids, metadatas=None, embeddings=None):
         kwargs: dict[str, Any] = {"documents": documents, "ids": ids}
@@ -829,7 +890,9 @@ class ChromaCollection(BaseCollection):
         if embeddings is not None:
             kwargs["embeddings"] = embeddings
         with self._write_lock():
+            self._ensure_fresh()
             self._collection.upsert(**kwargs)
+            self._mark_written()
 
     def update(
         self,
@@ -849,7 +912,9 @@ class ChromaCollection(BaseCollection):
         if embeddings is not None:
             kwargs["embeddings"] = embeddings
         with self._write_lock():
+            self._ensure_fresh()
             self._collection.update(**kwargs)
+            self._mark_written()
 
     # ------------------------------------------------------------------
     # Reads
@@ -994,7 +1059,9 @@ class ChromaCollection(BaseCollection):
         if where is not None:
             kwargs["where"] = where
         with self._write_lock():
+            self._ensure_fresh()
             self._collection.delete(**kwargs)
+            self._mark_written()
 
     def count(self):
         return self._collection.count()
@@ -1309,6 +1376,7 @@ class ChromaBackend(BaseBackend):
         client = self._client(palace_path)
         with palace_write_lock(palace_path):
             client.delete_collection(collection_name)
+            _bump_generation(palace_path)
 
     def create_collection(
         self,
@@ -1344,6 +1412,7 @@ class ChromaBackend(BaseBackend):
                 metadata=metadata,
                 **ef_kwargs,
             )
+            _bump_generation(palace_path)
         return ChromaCollection(collection, palace_path=palace_path)
 
 
