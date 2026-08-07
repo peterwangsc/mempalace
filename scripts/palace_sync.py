@@ -142,7 +142,7 @@ class Peer:
     def sh(self, script):
         if self.remote:
             return run(["ssh", "-o", "BatchMode=yes", self.ssh, self.shell], input=script)
-        return run(["bash", "-s"], input=script)
+        return run(shlex.split(self.shell), input=script)
 
     def tar_delta(self, tar: str, files: list):
         """Archive exactly `files`, relative to this peer's projects_dir."""
