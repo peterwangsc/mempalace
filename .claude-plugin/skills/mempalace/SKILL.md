@@ -92,24 +92,27 @@ what proves wrong. Record the fact that prevents the error, not the error.
 
 ## Mechanics
 
-MemPalace ships dynamic instructions via its CLI. For the mechanics of any
-operation:
-
-```bash
-mempalace instructions <command>
-```
-
-Where `<command>` is one of: `help`, `init`, `mine`, `search`, `status`. Those
-cover setup, filing, and mining. They do not cover the method above — that is
-what this skill is for.
-
-Prefer the MCP tools when available: `mempalace_search` first, then
-`mempalace_kg_query` for atomic facts, `mempalace_diary_read` for reflections,
-`mempalace_traverse` and `mempalace_find_tunnels` for relations.
+Prefer the MCP tools: `mempalace_search` first, then `mempalace_kg_query` for
+atomic facts, `mempalace_diary_read` for reflections, `mempalace_traverse` and
+`mempalace_find_tunnels` for relations. Their live descriptions are the
+authority on arguments; do not restate them here.
 
 Search hygiene: only `query` is embedded, so keep it short; `context` is not
 embedded and text there is wasted; `max_distance` defaults to 1.5, and 0.6-0.8
-narrows to a near-exact memory. Wing filtering is unreliable — on an empty
-wing-filtered result, retry with no filter.
+narrows to a near-exact memory. Wing filtering is unreliable — search globally
+and narrow only if the results demand it, and on an empty wing-filtered result
+retry with no filter.
+
+**Do not run `mempalace instructions <command>`.** It emits a generic setup
+wizard written for a single machine — ask-the-user prompts, next-step menus, a
+stale tool count, and a search procedure that tells you to filter by wing,
+which contradicts the line above. Its five topics cover four of the CLI's
+fifteen subcommands, omitting `sweep`, `wake-up`, `compress`, `repair` and
+`repair-status`. Read `mempalace <command> --help` for real flags.
+
+How this palace is mined, synced and repaired — which wing a transcript belongs
+to, what must never be re-rooted, what is excluded from mining, and whether any
+of it is automatic — is machine-specific and lives in the operating manual.
+That file governs. Nothing here restates it, so the two cannot drift apart.
 
 Installation, if missing: `pip install mempalace`.
