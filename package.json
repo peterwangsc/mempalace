@@ -1,0 +1,12 @@
+{
+  "name": "mempalace-tools",
+  "private": true,
+  "description": "Task runner for the operational scripts. The package itself is Python; this exists only so the sync has a memorable entry point.",
+  "scripts": {
+    "sync": "python scripts/palace_sync.py",
+    "sync:lan": "python scripts/palace_sync.py",
+    "sync:dry": "python scripts/palace_sync.py --dry-run",
+    "sync:pull": "python scripts/palace_sync.py --pull-only",
+    "sync:push": "python scripts/palace_sync.py --push-only"
+  }
+}
