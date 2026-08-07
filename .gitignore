@@ -39,3 +39,7 @@ venv/
 
 # Local scratch — repro cases, one-off scripts, incident artifacts
 tmp/
+
+# machine-pair specifics, never upstream
+scripts/palace_sync.config.json
+PALACE_SYNC_NOTES.md
