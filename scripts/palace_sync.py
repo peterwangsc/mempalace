@@ -16,11 +16,13 @@ PATH is a dead WSL stub. There is no PowerShell or cmd syntax anywhere here.
 Every rule below is here because breaking it cost real damage once:
 
   mine parity       Ship exactly what `mempalace mine --mode convos` ingests:
-                    it os.walks the tree and takes .jsonl/.txt/.md/.json, so the
-                    Stop and SessionEnd hooks already file subagent transcripts,
-                    tool-results and memory on the machine of origin. A sync that
-                    filtered them would leave the mirror holding less than the
-                    palace it mirrors. Only *.meta.json and ._* are dropped.
+                    an os.walk taking .jsonl/.txt/.md/.json, minus CONVO_SKIP_DIRS.
+                    The Stop and SessionEnd hooks already file that same set on
+                    the machine of origin, so a sync that filtered more would
+                    leave the mirror holding less than the palace it mirrors, and
+                    filtering less would file what the origin never did. Subagent
+                    transcripts travel; tool-results do not; *.meta.json and ._*
+                    are dropped. Keep this walk and CONVO_SKIP_DIRS in step.
   delta only        A full ship is 646 MB and minutes of CPU the cursor then
                     skips. Compare sizes against the mirror and send the rest.
   fixed mirrors     drawer_id = sha256(source_file + chunk)[:24] over the FULL
@@ -55,6 +57,7 @@ skip = sys.argv[2].split('|') if len(sys.argv) > 2 and sys.argv[2] else []
 EXT = ('.jsonl', '.txt', '.md', '.json')
 out = {}
 for base, dirs, files in os.walk(root):
+    dirs[:] = [d for d in dirs if d != 'tool-results']
     rel = os.path.relpath(base, root).replace(os.sep, '/')
     if rel == '.':
         continue
@@ -81,6 +84,8 @@ def scan(root: Path, skip=()):
         return out
     for f in sorted(root.rglob("*")):
         if not f.is_file() or f.parent == root:
+            continue
+        if "tool-results" in f.relative_to(root).parts:
             continue
         if f.suffix.lower() not in EXTENSIONS or f.name.endswith(".meta.json"):
             continue

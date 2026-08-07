@@ -60,6 +60,14 @@ CONVO_EXTENSIONS = {
     ".jsonl",
 }
 
+# `<project>/<session-uuid>/tool-results/` holds the raw bytes a tool returned
+# before anyone reasoned about them: linter output, grep dumps, stray HTML, and
+# serialised mempalace search responses that file the palace's own results back
+# as palace content. Subagent transcripts next door are kept deliberately — they
+# carry findings and verdicts — but nothing in here does. Scoped to convos mode
+# so a code project may still have a directory of that name.
+CONVO_SKIP_DIRS = SKIP_DIRS | {"tool-results"}
+
 MIN_CHUNK_SIZE = 30
 CHUNK_SIZE = 800  # chars per drawer — align with miner.py
 DRAWER_UPSERT_BATCH_SIZE = 1000
@@ -476,7 +484,7 @@ def scan_convos(convo_dir: str) -> list:
     convo_path = Path(convo_dir).expanduser().resolve()
     files = []
     for root, dirs, filenames in os.walk(convo_path):
-        dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
+        dirs[:] = [d for d in dirs if d not in CONVO_SKIP_DIRS]
         for filename in filenames:
             if filename.endswith(".meta.json"):
                 continue
