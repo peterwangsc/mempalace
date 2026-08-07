@@ -158,6 +158,25 @@ Knowledge Graph:
 - **Input validation**: `mempalace/config.py` — `sanitize_name()` / `sanitize_content()`
 - **Tests**: mirror source structure in `tests/test_<module>.py`
 
+## Two-machine sync
+
+`./sync.sh` (mac) or `.\sync.ps1` (PC) runs `scripts/palace_sync.py`, which syncs
+both directions from whichever side you are on. **`PALACE_SYNC_NOTES.md` is the
+protocol** — read it before touching the sync, the mirrors, or wing naming.
+
+Two invariants it exists to protect. `drawer_id` hashes the **full absolute**
+`source_file`, so a mirror directory that moves refiles the entire corpus as
+duplicate drawers; the mirrors are permanent addresses. And the sync must ship
+exactly what `mempalace mine --mode convos` ingests — `CONVO_EXTENSIONS` minus
+`CONVO_SKIP_DIRS` — because the Stop and SessionEnd hooks already mine the whole
+project tree on the machine of origin. Filtering more than the miner leaves the
+mirror holding less than the palace it mirrors; filtering less files content the
+origin never did. Subagent transcripts are kept deliberately; `tool-results/` is
+skipped deliberately. Change one side of that pair and you must change the other.
+
+`scripts/palace_sync.config.json` is gitignored and describes one machine pair;
+copy `palace_sync.config.example.json` to create it.
+
 ## Palace Repair — salvage first, `repair --yes` last
 
 When the MCP server dies on every call (SIGSEGV / "Connection closed") and the
