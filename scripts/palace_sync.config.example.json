@@ -1,0 +1,32 @@
+{
+  "_comment": [
+    "Copy to palace_sync.config.json and fill in. That file is gitignored: it",
+    "describes one pair of machines, not the software.",
+    "",
+    "mirror_dir is where THIS machine keeps the OTHER machine's transcripts.",
+    "It is a permanent address. Drawer IDs hash the full absolute source path,",
+    "so changing it refiles the entire corpus as duplicate drawers.",
+    "",
+    "pre_mine runs before each mine on that side. macOS needs `ulimit -n 10240`",
+    "or chroma dies mid-mine with 'Too many open files' (its default is 256)."
+  ],
+  "local": {
+    "name": "pc",
+    "projects_dir": "C:/Users/you/.claude/projects",
+    "mirror_dir": "C:/Users/you/mac-transcripts",
+    "mempalace": "C:/Users/you/code/mempalace/.venv/Scripts/mempalace.exe",
+    "python": "python",
+    "tmp_dir": "C:/Users/you/AppData/Local/Temp",
+    "pre_mine": ""
+  },
+  "remote": {
+    "name": "mac",
+    "ssh": "user@host.local",
+    "projects_dir": "/Users/you/.claude/projects",
+    "mirror_dir": "/Users/you/pc-transcripts",
+    "mempalace": "/Users/you/code/mempalace/.venv/bin/mempalace",
+    "python": "python3",
+    "tmp_dir": "/tmp",
+    "pre_mine": "ulimit -n 10240"
+  }
+}
