@@ -152,6 +152,10 @@ class Peer:
                 f"tar {self.tar_opt}-czf {shlex.quote(tar)} -T {shlex.quote(tar)}.list\n"
                 f"rm -f {shlex.quote(tar)}.list\n")
 
+    def tar_count(self, tar: str) -> int:
+        out = self.sh(f"tar {self.tar_opt}-tzf {shlex.quote(tar)} 2>/dev/null | wc -l")
+        return int(out.stdout.strip() or 0)
+
     def sha256(self, path: str) -> str:
         out = self.sh(f"{shlex.quote(self.python)} - {shlex.quote(path)} <<'PYEOF'\n"
                       "import hashlib, sys\n"
@@ -235,6 +239,13 @@ def ship(src: Peer, dst: Peer, todo: list) -> None:
     # Build the archive from an explicit file list: nothing but the delta can end
     # up inside it.
     src.tar_delta(src_tar, todo)
+
+    held = src.tar_count(src_tar)
+    if held < len(todo):
+        raise SystemExit(
+            f"{tar_name} holds {held} entries for a {len(todo)}-file delta - "
+            f"refusing to ship. sha256 cannot catch this: an empty archive "
+            f"transfers faithfully and matches on both sides.")
 
     # Move it. scp needs one local and one remote endpoint.
     if src.remote and not dst.remote:
