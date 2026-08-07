@@ -157,3 +157,29 @@ Knowledge Graph:
 - **Adding a storage backend**: subclass `mempalace/backends/base.py`, register in `backends/__init__.py`
 - **Input validation**: `mempalace/config.py` — `sanitize_name()` / `sanitize_content()`
 - **Tests**: mirror source structure in `tests/test_<module>.py`
+
+## Palace Repair — salvage first, `repair --yes` last
+
+When the MCP server dies on every call (SIGSEGV / "Connection closed") and the
+palace needs rebuilding, **`tmp/SALVAGE_RUNBOOK.md` is the first protocol to try.**
+It supersedes `mempalace repair --yes` and every earlier rebuild procedure,
+including the one in `tmp/PALACE_RUNBOOK.md`.
+
+An HNSW segment that segfaults on open has a corrupt **link graph**; its vectors
+are intact. `repair --yes` discards them and re-runs ONNX inference on every
+chunk — that is the entire cost. Reading the vectors back out of the quarantined
+`data_level0.bin` and upserting them via `ChromaCollection.upsert(embeddings=...)`
+produces an identical index without embedding anything.
+
+Measured on the live 199,152-drawer palace, 2026-07-22: **4m20s (~1,000/s) versus
+~66min (~50/s)** — 16x, with salvaged vectors matching fresh embeddings at cosine
+1.00000. Fall back to `repair --yes` only when the runbook's two validation gates
+(unit-norm check, cosine-vs-fresh spot check) fail.
+
+Two facts that cost real time and belong here rather than only in the runbook:
+`repair-status` reports **OK while the palace is fatally corrupt**, because counts
+stay within flush-lag tolerance while the graph is destroyed — the only reliable
+probe is opening the collection in a throwaway process and checking for exit code
+139. And `repair --yes` **empties sqlite before refilling it**, so mid-run the only
+complete copy of the verbatim text is that process's RAM plus `palace.backup`;
+verify the backup's row count before killing a running repair.
