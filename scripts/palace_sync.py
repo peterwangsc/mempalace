@@ -104,11 +104,16 @@ def wing_for(project_dir: str) -> str:
 def run(cmd, **kw):
     """check=True with the far side's stderr attached to the failure.
 
+    Scripts cross as bytes: text mode on Windows rewrites every \\n in `input` to
+    \\r\\n, and a POSIX shell then reads a tar target named `x.list\\r`.
+
     CalledProcessError prints only the argv, and for an ssh call that argv is
     `bash -s` — the actual command and its error live in the payload and the
     stream, so a bare traceback says nothing about what went wrong.
     """
-    p = subprocess.run(cmd, text=True, capture_output=True, **kw)
+    kw["input"] = kw["input"].encode() if "input" in kw else None
+    p = subprocess.run(cmd, capture_output=True, **kw)
+    p.stdout, p.stderr = (s.decode("utf-8", "replace") for s in (p.stdout, p.stderr))
     if p.returncode:
         raise SystemExit(f"exit {p.returncode} from {cmd[0]}\n"
                          f"--- stdout ---\n{p.stdout[-4000:]}\n"
