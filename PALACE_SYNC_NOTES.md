@@ -59,6 +59,29 @@ the wing is baked into the drawer ID.
 
 ## Sync procedure — one command, from either side
 
+### Claude and Codex sources (2026-09-09)
+
+Both `sync.sh` and `sync.ps1` call `scripts/palace_sync.py`. Existing
+`projects_dir` and `mirror_dir` remain the Claude source and permanent mirror.
+To include Codex, configure **both peers** with `codex_projects_dir` pointing at
+their `~/.codex/mempalace-transcripts` hook exports and `codex_mirror_dir` pointing
+at a separate permanent mirror: `C:/Users/pewa/mac-codex-transcripts` on PC and
+`/Users/peterwang/pc-codex-transcripts` on Mac. Never nest it in the Claude mirror.
+The default sync includes all configured sources; `--source codex` or
+`--source claude` limits a run. Old configurations still sync Claude with an
+explicit notice that Codex is not configured. Partial Codex configurations fail.
+
+Codex exports already group by canonical machine-origin project wing. The same
+wing rule applies to both formats. Raw `sessions/YYYY/MM/DD` trees and SQLite
+databases are not sync sources. Hooks create exports as sessions progress;
+older sessions need a one-time adapter backfill before they can sync. This sync
+does not backfill unexported history or copy the vector database.
+
+Sync refuses to overwrite a longer mirror transcript with a shorter source.
+Equal sizes still mean unchanged under the existing append-only assumption.
+Coordinate one sync invocation for the pair; the script is not a concurrent
+bidirectional scheduler. Verify both checkouts/configurations before running it.
+
 Transcripts are the source of truth; the vector DB is derived. Never attempt to
 merge `chroma.sqlite3` files — there is no import path (`exporter.py` emits lossy
 markdown only), and hand-editing Chroma internals has corrupted this palace before.

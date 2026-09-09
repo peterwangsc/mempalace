@@ -13,6 +13,8 @@
   "local": {
     "name": "pc",
     "projects_dir": "C:/Users/you/.claude/projects",
+    "codex_projects_dir": "C:/Users/you/.codex/mempalace-transcripts",
+    "codex_mirror_dir": "C:/Users/you/mac-codex-transcripts",
     "mirror_dir": "C:/Users/you/mac-transcripts",
     "mempalace": "C:/Users/you/code/mempalace/.venv/Scripts/mempalace.exe",
     "python": "python",
@@ -23,6 +25,8 @@
     "name": "mac",
     "ssh": "user@host.local",
     "projects_dir": "/Users/you/.claude/projects",
+    "codex_projects_dir": "/Users/you/.codex/mempalace-transcripts",
+    "codex_mirror_dir": "/Users/you/pc-codex-transcripts",
     "mirror_dir": "/Users/you/pc-transcripts",
     "mempalace": "/Users/you/code/mempalace/.venv/bin/mempalace",
     "python": "python3",

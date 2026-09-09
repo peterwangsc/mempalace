@@ -35,7 +35,13 @@ Every rule below is here because breaking it cost real damage once:
   ulimit -n 10240   macOS defaults to 256; chroma reopens its client mid-mine and
                     dies with "Too many open files".
 """
-import argparse, json, os, shlex, subprocess, sys
+
+import argparse
+import json
+import os
+import shlex
+import subprocess
+import sys
 from fnmatch import fnmatch
 from pathlib import Path
 
@@ -98,7 +104,9 @@ def scan(root: Path, skip=()):
 def wing_for(project_dir: str) -> str:
     """`-Users-peterwang-code-golfcore` -> `_users_peterwang_code_golfcore`,
     `C--Users-pewa-code-golfcore` -> `c__users_pewa_code_golfcore`."""
-    return project_dir.lower().replace("-", "_")
+    from mempalace.config import normalize_wing_name
+
+    return normalize_wing_name(project_dir)
 
 
 def run(cmd, **kw):
@@ -115,9 +123,11 @@ def run(cmd, **kw):
     p = subprocess.run(cmd, capture_output=True, **kw)
     p.stdout, p.stderr = (s.decode("utf-8", "replace") for s in (p.stdout, p.stderr))
     if p.returncode:
-        raise SystemExit(f"exit {p.returncode} from {cmd[0]}\n"
-                         f"--- stdout ---\n{p.stdout[-4000:]}\n"
-                         f"--- stderr ---\n{p.stderr[-4000:]}")
+        raise SystemExit(
+            f"exit {p.returncode} from {cmd[0]}\n"
+            f"--- stdout ---\n{p.stdout[-4000:]}\n"
+            f"--- stderr ---\n{p.stderr[-4000:]}"
+        )
     return p
 
 
@@ -152,25 +162,31 @@ class Peer:
     def tar_delta(self, tar: str, files: list):
         """Archive exactly `files`, relative to this peer's projects_dir."""
         body = "\n".join("./" + f for f in files)
-        self.sh(f"set -e\ncd {shlex.quote(self.projects_dir)}\n"
-                f"cat > {shlex.quote(tar)}.list <<'LIST'\n{body}\nLIST\n"
-                f"tar {self.tar_opt}-czf {shlex.quote(tar)} -T {shlex.quote(tar)}.list\n"
-                f"rm -f {shlex.quote(tar)}.list\n")
+        self.sh(
+            f"set -e\ncd {shlex.quote(self.projects_dir)}\n"
+            f"cat > {shlex.quote(tar)}.list <<'LIST'\n{body}\nLIST\n"
+            f"tar {self.tar_opt}-czf {shlex.quote(tar)} -T {shlex.quote(tar)}.list\n"
+            f"rm -f {shlex.quote(tar)}.list\n"
+        )
 
     def tar_count(self, tar: str) -> int:
         out = self.sh(f"tar {self.tar_opt}-tzf {shlex.quote(tar)} 2>/dev/null | wc -l")
         return int(out.stdout.strip() or 0)
 
     def sha256(self, path: str) -> str:
-        out = self.sh(f"{shlex.quote(self.python)} - {shlex.quote(path)} <<'PYEOF'\n"
-                      "import hashlib, sys\n"
-                      "print(hashlib.sha256(open(sys.argv[1],'rb').read()).hexdigest())\n"
-                      "PYEOF\n")
+        out = self.sh(
+            f"{shlex.quote(self.python)} - {shlex.quote(path)} <<'PYEOF'\n"
+            "import hashlib, sys\n"
+            "print(hashlib.sha256(open(sys.argv[1],'rb').read()).hexdigest())\n"
+            "PYEOF\n"
+        )
         return out.stdout.strip().lower()
 
     def _remote_scan(self, root, skip=()):
-        r = self.sh(f"{shlex.quote(self.python)} - {shlex.quote(root)} "
-                    f"{shlex.quote('|'.join(skip))} <<'PYEOF'\n{MANIFEST_PROG}\nPYEOF\n")
+        r = self.sh(
+            f"{shlex.quote(self.python)} - {shlex.quote(root)} "
+            f"{shlex.quote('|'.join(skip))} <<'PYEOF'\n{MANIFEST_PROG}\nPYEOF\n"
+        )
         return json.loads(r.stdout)
 
     def manifest(self):
@@ -193,7 +209,62 @@ def delta(src: dict, dst: dict):
     Transcripts are append-only, so a size match means nothing new. This is the
     materialised form of the cursor: the mirror is how far the far side has got.
     """
+    shortened = [k for k, n in src.items() if dst.get(k, -1) > n]
+    if shortened:
+        raise SystemExit(
+            f"Source transcripts shrank; preserving longer mirror copies: {shortened[:5]}"
+        )
     return sorted(k for k, n in src.items() if dst.get(k, -1) != n)
+
+
+def source_pairs(cfg, selected="all"):
+    """Keep Claude's existing addresses; opt Codex into a separate fixed mirror.
+
+    Codex sources are hook exports grouped by origin wing, never raw rollout
+    YYYY/MM/DD directories or history databases. Validate every pair before any
+    transfer so a partial configuration cannot silently omit one direction.
+    """
+    pairs = []
+    sides = [cfg["local"], cfg["remote"]]
+    codex_keys = ("codex_projects_dir", "codex_mirror_dir")
+    has_codex = any(side.get(key) for side in sides for key in codex_keys)
+    if has_codex and not all(side.get(key) for side in sides for key in codex_keys):
+        raise SystemExit("Both peers require codex_projects_dir and codex_mirror_dir")
+    for side in sides:
+        if not side.get("projects_dir") or not side.get("mirror_dir"):
+            raise SystemExit(f"{side['name']}: mirror_dir and projects_dir are both required")
+        if has_codex:
+            # Sources and mirrors must not overlap, including a Codex mirror
+            # nested beneath the old Claude mirror (which mines recursively).
+            paths = [
+                side[key].replace("\\", "/").rstrip("/").lower()
+                for key in ("projects_dir", "mirror_dir", *codex_keys)
+            ]
+            for i, path in enumerate(paths):
+                for other in paths[i + 1 :]:
+                    if (
+                        path == other
+                        or path.startswith(other + "/")
+                        or other.startswith(path + "/")
+                    ):
+                        raise SystemExit(
+                            f"{side['name']}: transcript sources and mirrors must not overlap"
+                        )
+    if selected in ("all", "claude"):
+        pairs.append(("claude", Peer(sides[0], False), Peer(sides[1], True)))
+    if selected in ("all", "codex") and has_codex:
+        peers = []
+        for side, remote in zip(sides, (False, True)):
+            settings = dict(
+                side, projects_dir=side["codex_projects_dir"], mirror_dir=side["codex_mirror_dir"]
+            )
+            peers.append(Peer(settings, remote))
+        pairs.append(("codex", *peers))
+    elif selected == "codex":
+        raise SystemExit("Codex sync is not configured on this pair")
+    elif selected == "all" and not has_codex:
+        print("Codex sync is not configured; syncing Claude only.")
+    return pairs
 
 
 def sync(src: Peer, dst: Peer, label: str, args) -> int:
@@ -229,8 +300,10 @@ def sync(src: Peer, dst: Peer, label: str, args) -> int:
         print(f"    mining {proj} -> wing {wing}")
         env = "PYTHONUNBUFFERED=1 PYTHONUTF8=1 PYTHONIOENCODING=utf-8"
         pre = f"{dst.pre_mine} && " if getattr(dst, "pre_mine", "") else ""
-        dst.sh(f"{pre}{env} {shlex.quote(dst.mempalace)} mine {shlex.quote(path)} "
-               f"--mode convos --cursor --wing {shlex.quote(wing)}")
+        dst.sh(
+            f"{pre}{env} {shlex.quote(dst.mempalace)} mine {shlex.quote(path)} "
+            f"--mode convos --cursor --wing {shlex.quote(wing)}"
+        )
     return len(todo)
 
 
@@ -250,7 +323,8 @@ def ship(src: Peer, dst: Peer, todo: list) -> None:
         raise SystemExit(
             f"{tar_name} holds {held} entries for a {len(todo)}-file delta - "
             f"refusing to ship. sha256 cannot catch this: an empty archive "
-            f"transfers faithfully and matches on both sides.")
+            f"transfers faithfully and matches on both sides."
+        )
 
     # Move it. scp needs one local and one remote endpoint.
     if src.remote and not dst.remote:
@@ -266,10 +340,12 @@ def ship(src: Peer, dst: Peer, todo: list) -> None:
     print(f"    shipped {tar_name}, sha256 verified")
 
     # Extract into the permanent mirror. Never anywhere else.
-    dst.sh(f"set -e\nmkdir -p {shlex.quote(dst.mirror_dir)}\n"
-           f"tar {dst.tar_opt}-xzf {shlex.quote(dst_tar)} -C {shlex.quote(dst.mirror_dir)}\n"
-           f"find {shlex.quote(dst.mirror_dir)} -name '._*' -delete\n"
-           f"rm -f {shlex.quote(dst_tar)}\n")
+    dst.sh(
+        f"set -e\nmkdir -p {shlex.quote(dst.mirror_dir)}\n"
+        f"tar {dst.tar_opt}-xzf {shlex.quote(dst_tar)} -C {shlex.quote(dst.mirror_dir)}\n"
+        f"find {shlex.quote(dst.mirror_dir)} -name '._*' -delete\n"
+        f"rm -f {shlex.quote(dst_tar)}\n"
+    )
 
     # Nothing is pruned from the mirror. The hooks on the machine of origin mine
     # its whole project tree — subagents, tool-results and memory included — so a
@@ -284,28 +360,26 @@ def main():
     ap.add_argument("--dry-run", action="store_true", help="report the delta, ship nothing")
     ap.add_argument("-v", "--verbose", action="store_true")
     ap.add_argument("--config", default=str(CONFIG))
+    ap.add_argument(
+        "--source",
+        choices=("all", "claude", "codex"),
+        default="all",
+        help="transcript source to sync (default: all configured sources)",
+    )
     args = ap.parse_args()
 
     cfg_path = Path(args.config)
     if not cfg_path.exists():
         sys.exit(f"no config at {cfg_path}\nCopy palace_sync.config.example.json and fill it in.")
     cfg = json.loads(cfg_path.read_text())
-    local, remote = Peer(cfg["local"], False), Peer(cfg["remote"], True)
-
-    # A mirror that does not exist yet is fine; one that is wrong is not, so make
-    # the operator say the path rather than letting the script guess.
-    for p in (local, remote):
-        if not p.mirror_dir or not p.projects_dir:
-            sys.exit(f"{p.name}: mirror_dir and projects_dir are both required")
-
     moved = 0
-    if not args.push_only:
-        moved += sync(remote, local, "PULL", args)
-    if not args.pull_only:
-        moved += sync(local, remote, "PUSH", args)
+    for source, local, remote in source_pairs(cfg, args.source):
+        if not args.push_only:
+            moved += sync(remote, local, f"PULL {source}", args)
+        if not args.pull_only:
+            moved += sync(local, remote, f"PUSH {source}", args)
     print(f"\ndone â€” {moved} transcript(s) moved")
 
 
 if __name__ == "__main__":
     main()
-
