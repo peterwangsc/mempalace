@@ -268,6 +268,25 @@ def _try_codex_jsonl(content: str) -> Optional[str]:
             continue
 
         payload_type = payload.get("type", "")
+        if payload_type == "item_completed":
+            item = payload.get("item", {})
+            if not isinstance(item, dict):
+                continue
+            if item.get("type") == "userMessage":
+                text = "\n".join(
+                    part["text"]
+                    for part in item.get("content", [])
+                    if isinstance(part, dict)
+                    and part.get("type") == "text"
+                    and isinstance(part.get("text"), str)
+                )
+                if text:
+                    messages.append(("user", text))
+            elif item.get("type") == "agentMessage":
+                text = item.get("text")
+                if isinstance(text, str) and text:
+                    messages.append(("assistant", text))
+            continue
         msg = payload.get("message")
         if not isinstance(msg, str):
             continue

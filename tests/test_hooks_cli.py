@@ -324,7 +324,8 @@ def test_wing_from_transcript_path_windows_backslashes():
     # POSIX-host behavior so a future refactor that "fixes" it inadvertently
     # by string-splitting on `\\` doesn't reintroduce a parallel namespace.
     path = "C:\\Users\\jp\\.claude\\projects\\-home-jp-Projects-myapp\\session.jsonl"
-    assert _wing_from_transcript_path(path) == "_sessions"
+    expected = "_home_jp_projects_myapp" if os.name == "nt" else "_sessions"
+    assert _wing_from_transcript_path(path) == expected
 
 
 def test_wing_from_transcript_path_lowercases():

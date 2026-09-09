@@ -152,6 +152,18 @@ def _count_human_messages(transcript_path: str) -> int:
                             msg_text = payload.get("message", "")
                             if isinstance(msg_text, str) and "<command-message>" not in msg_text:
                                 count += 1
+                        elif isinstance(payload, dict) and payload.get("type") == "item_completed":
+                            item = payload.get("item", {})
+                            if isinstance(item, dict) and item.get("type") == "userMessage":
+                                msg_text = "\n".join(
+                                    part["text"]
+                                    for part in item.get("content", [])
+                                    if isinstance(part, dict)
+                                    and part.get("type") == "text"
+                                    and isinstance(part.get("text"), str)
+                                )
+                                if msg_text and "<command-message>" not in msg_text:
+                                    count += 1
                 except (json.JSONDecodeError, AttributeError):
                     pass
     except OSError:
