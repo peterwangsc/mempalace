@@ -204,12 +204,14 @@ class Peer:
 
 
 def delta(src: dict, dst: dict):
-    """Files the destination is missing or holds a shorter copy of.
+    """Files the destination is missing or holds a different-sized copy of.
 
-    Transcripts are append-only, so a size match means nothing new. This is the
-    materialised form of the cursor: the mirror is how far the far side has got.
+    Session transcripts (.jsonl) are append-only, so a mirror copy longer than
+    the source means the source lost data, and the longer copy is kept. Memory
+    notes and other .md/.txt/.json files are edited in place and may shrink;
+    those ship whenever the size differs.
     """
-    shortened = [k for k, n in src.items() if dst.get(k, -1) > n]
+    shortened = [k for k, n in src.items() if k.endswith(".jsonl") and dst.get(k, -1) > n]
     if shortened:
         raise SystemExit(
             f"Source transcripts shrank; preserving longer mirror copies: {shortened[:5]}"
