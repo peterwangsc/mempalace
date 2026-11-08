@@ -180,6 +180,10 @@ def main():
                     ],
                     check=True,
                     timeout=600,
+                    stdin=subprocess.DEVNULL,
+                    stdout=sys.stdout,
+                    stderr=sys.stderr,
+                    creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
                 )
         if args.worker:
             args.worker.unlink()
@@ -189,7 +193,8 @@ def main():
     request = pending / f"{time.time_ns()}-{os.getpid()}.json"
     request.write_text(json.dumps(payload), encoding="utf-8")
     options = (
-        {"creationflags": subprocess.CREATE_NO_WINDOW | subprocess.DETACHED_PROCESS}
+        # Windows ignores CREATE_NO_WINDOW when combined with DETACHED_PROCESS.
+        {"creationflags": subprocess.CREATE_NO_WINDOW}
         if os.name == "nt"
         else {"start_new_session": True}
     )
