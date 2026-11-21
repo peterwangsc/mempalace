@@ -158,3 +158,54 @@ def test_mine_convos_rebuilds_stale_drawers_after_schema_bump(capsys):
         del col, client
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def _turn(q, a):
+    import json
+
+    return (
+        json.dumps({"type": "user", "message": {"role": "user", "content": q}})
+        + "\n"
+        + json.dumps(
+            {
+                "type": "assistant",
+                "message": {"role": "assistant", "content": [{"type": "text", "text": a}]},
+            }
+        )
+        + "\n"
+    )
+
+
+def _drawers(palace, source_file):
+    col = chromadb.PersistentClient(path=palace).get_collection("mempalace_drawers")
+    return col.get(where={"source_file": source_file})["ids"]
+
+
+def test_unchanged_files_skip_on_size_stamp_and_grown_files_still_mine(tmp_path, monkeypatch):
+    import mempalace.convo_miner as cm
+
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    t = proj / "s.jsonl"
+    t.write_text(_turn("how do we sync the palace between machines " * 5, "ship tails " * 40) * 3)
+    (proj / "note.md").write_text("# note\n\n" + "the mirror never moves. " * 30)
+    palace = str(tmp_path / "palace")
+    mine_convos(str(proj), palace, wing="w", cursor=True)
+    first = set(_drawers(palace, str(t.resolve())))
+    assert first
+
+    def slow(*a, **k):
+        raise AssertionError("slow path ran for an unchanged file")
+
+    monkeypatch.setattr(cm, "_find_safe_boundary", slow)
+    monkeypatch.setattr(cm, "file_already_mined", slow)
+    mine_convos(str(proj), palace, wing="w", cursor=True)
+    monkeypatch.undo()
+
+    with open(t, "a") as f:
+        f.write(_turn("what about the pending queue " * 5, "it drains per file " * 40))
+    mine_convos(str(proj), palace, wing="w", cursor=True)
+    grown = set(_drawers(palace, str(t.resolve())))
+    assert first < grown
+    mine_convos(str(proj), palace, wing="w", cursor=True)
+    assert set(_drawers(palace, str(t.resolve()))) == grown

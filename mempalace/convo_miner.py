@@ -81,7 +81,44 @@ MAX_FILE_SIZE = 500 * 1024 * 1024  # 500 MB — skip files larger than this.
 # use also scales with source size.
 
 
-def _register_file(collection, source_file: str, wing: str, agent: str):
+def _reg_id(source_file: str) -> str:
+    return f"_reg_{hashlib.sha256(source_file.encode()).hexdigest()[:24]}"
+
+
+def _read_registry(collection, source_files: list) -> dict:
+    found = {}
+    if collection is None:
+        return found
+    for i in range(0, len(source_files), 500):
+        r = collection.get(
+            ids=[_reg_id(f) for f in source_files[i : i + 500]], include=["metadatas"]
+        )
+        for meta in r.get("metadatas") or []:
+            if meta and meta.get("source_file"):
+                found[meta["source_file"]] = meta
+    return found
+
+
+def _unchanged(registry: dict, source_file: str, size: int) -> bool:
+    meta = registry.get(source_file) or {}
+    return meta.get("source_size") == size and meta.get("normalize_version", 1) >= NORMALIZE_VERSION
+
+
+def _stamp_sizes(collection, sizes: dict, wing_of: dict, agent: str) -> None:
+    if collection is None or not sizes:
+        return
+    have = _read_registry(collection, list(sizes))
+    old = [f for f in sizes if f in have]
+    for i in range(0, len(old), 500):
+        part = old[i : i + 500]
+        collection.update(
+            ids=[_reg_id(f) for f in part], metadatas=[{"source_size": sizes[f]} for f in part]
+        )
+    for f in (f for f in sizes if f not in have):
+        _register_file(collection, f, wing_of[f], agent, sizes[f])
+
+
+def _register_file(collection, source_file: str, wing: str, agent: str, source_size=None):
     """Write a sentinel so file_already_mined() returns True for 0-chunk files.
 
     Without this, files that normalize to nothing or produce zero chunks are
@@ -101,6 +138,7 @@ def _register_file(collection, source_file: str, wing: str, agent: str):
                 "filed_at": datetime.now().isoformat(),
                 "ingest_mode": "registry",
                 "normalize_version": NORMALIZE_VERSION,
+                **({} if source_size is None else {"source_size": source_size}),
             }
         ],
     )
@@ -1169,10 +1207,17 @@ def mine_convos(
     total_drawers = 0
     files_skipped = 0
     room_counts = defaultdict(int)
+    registry = _read_registry(collection, [str(f) for f in files])
+    sizes, wing_of = {}, {}
 
     for i, filepath in enumerate(files, 1):
         source_file = str(filepath)
+        size = filepath.stat().st_size
+        if _unchanged(registry, source_file, size):
+            files_skipped += 1
+            continue
         wing = _derive_wing_for_file(filepath, convo_path, wing_override)
+        sizes[source_file], wing_of[source_file] = size, wing
 
         # Cursor-aware path for append-only JSONL sources (Claude Code,
         # Codex CLI). Dry-run is excluded so it never touches the
@@ -1270,6 +1315,8 @@ def mine_convos(
         # re-processing the whole file.
         if cursor:
             _init_cursor_after_full_mine(collection, filepath, source_file, wing, agent)
+
+    _stamp_sizes(collection, sizes, wing_of, agent)
 
     print(f"\n{'=' * 55}")
     print("  Done.")
