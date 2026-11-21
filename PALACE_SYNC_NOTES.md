@@ -119,12 +119,48 @@ Every path is absolute and permanent; see the `source_file` section above for wh
 2. Takes the delta by size. Transcripts are append-only, so a size match means
    nothing new; the mirror *is* the materialised cursor. Ships only what is
    missing or has grown.
-3. Tars the delta from an explicit file list, so nothing outside it can ride along.
-4. `scp`s it, then compares SHA-256 on both ends and aborts before extracting on a
-   mismatch — a truncated archive extracts to a plausible-looking subset.
-5. Extracts into the permanent mirror, deleting `._*` AppleDouble stubs.
-6. Mines one invocation per project directory, each `--mode convos --cursor` under
-   the origin wing derived from the project directory name.
+3. Queues the shipped projects in the destination's pending file.
+4. Streams one uncompressed Python `tarfile` over a single ssh pipe, built from the
+   explicit delta list, so nothing outside it can ride along. A grown `.jsonl`
+   sends only the bytes past the mirror's size. The receiver appends a tail only
+   when its copy is exactly that size and its last 4 KiB hash-match the source's;
+   otherwise it reports the file diverged and the sync re-ships it whole. Whole
+   files land as `.part` and are renamed into place. The receiver's applied count
+   must equal the delta, or the run fails.
+5. Mines one invocation per queued project directory, each `--mode convos --cursor`
+   under the origin wing derived from the project directory name.
+
+The PULL lane and the PUSH lane run concurrently, because they mine into
+different machines' palaces. Claude and Codex stay sequential inside a lane so
+one palace is never mined twice at once. Output lines carry their lane label.
+
+No compression, measured 2026-11-20: gzip -1 runs at 61 MB/s on the Mac, the
+same as the link, and only shrinks transcripts by 30%. A 300 MB file streamed in
+3.7 s Mac to PC and 4.2 s back, byte-exact by sha256 on both ends. Python's
+`tarfile` writes no `._*` AppleDouble members and needs no `--force-local`.
+
+The queue is `<mirror_dir>/.palace-sync-pending`, one project per line. A
+project leaves the queue only after its mine exits 0. An interrupted mine therefore stays
+queued and re-runs next sync, which is what the old mine-every-project pass was
+for. A missing queue file seeds every mirror project, so the first run and any
+deleted queue fall back to the full pass. Measured 2026-11-20: a no-op golfcore
+mine cost 15 s on the Mac and 56 s on the PC per sync.
+
+The miner itself now skips unchanged files on one batched read. `mine_convos`
+fetches every file's `_reg_` sentinel in one `get` by ID, and skips a file whose
+size equals the sentinel's `source_size`. Files that took the slow path get the
+size stamped at the end of a completed run, with a metadata-only `update` that
+keeps `byte_cursor`. A run that raises stamps nothing. Measured 2026-11-20 on
+the golfcore mirror: Mac 24.3 s to 1.2 s (587 files), PC 62.6 s to 3.8 s (839
+files), each after one stamping pass.
+
+The PC venv holds a non-editable install from its checkout, so a miner change
+needs `pip install --no-deps .` there. A running `mempalace-mcp.exe` locks the
+launcher and makes that install fail halfway, leaving `~empalace` stashes. Copy
+the changed module into `.venv/Lib/site-packages/mempalace/` instead.
+
+A source `.jsonl` shorter than its mirror copy is held, reported as `held`, and
+the run continues. Edited `.md`/`.txt`/`.json` notes ship when the size differs.
 
 ### What it ships
 

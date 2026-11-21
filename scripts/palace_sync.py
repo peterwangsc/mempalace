@@ -1,60 +1,18 @@
 #!/usr/bin/env python3
-"""Two-machine palace sync over SSH. Run from either side; it does both directions.
-
-    python scripts/palace_sync.py                 # pull then push
-    python scripts/palace_sync.py --pull-only
-    python scripts/palace_sync.py --dry-run
-
-Transcripts are the source of truth and the vector DB is derived, so this ships
-transcript files and re-mines. It never touches chroma.sqlite3 - there is no
-import path and hand-editing has corrupted a palace before.
-
-Both peers are driven through a POSIX shell: the PC reaches Git Bash via the
-`shell` key, since its OpenSSH hands commands to cmd.exe and its `bash.exe` on
-PATH is a dead WSL stub. There is no PowerShell or cmd syntax anywhere here.
-
-Every rule below is here because breaking it cost real damage once:
-
-  mine parity       Ship exactly what `mempalace mine --mode convos` ingests:
-                    an os.walk taking .jsonl/.txt/.md/.json, minus CONVO_SKIP_DIRS.
-                    The Stop and SessionEnd hooks already file that same set on
-                    the machine of origin, so a sync that filtered more would
-                    leave the mirror holding less than the palace it mirrors, and
-                    filtering less would file what the origin never did. Subagent
-                    transcripts travel; tool-results do not; *.meta.json and ._*
-                    are dropped. Keep this walk and CONVO_SKIP_DIRS in step.
-  delta only        A full ship is 646 MB and minutes of CPU the cursor then
-                    skips. Compare sizes against the mirror and send the rest.
-  fixed mirrors     drawer_id = sha256(source_file + chunk)[:24] over the FULL
-                    ABSOLUTE path, so a mirror that moves refiles the entire
-                    corpus as duplicates. The script refuses to invent one.
-  origin wing       The wing records which machine a conversation happened on.
-                    Derived from the project directory, never guessed.
-  ./ prefixes       Mac project dirs start with '-', which tar and find parse as
-                    a flag and then silently match nothing.
-  ulimit -n 10240   macOS defaults to 256; chroma reopens its client mid-mine and
-                    dies with "Too many open files".
-"""
-
 import argparse
 import json
-import os
 import shlex
 import subprocess
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from fnmatch import fnmatch
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 CONFIG = HERE / "palace_sync.config.json"
-
-# Emitted on the far side to inventory transcripts. Sent over stdin so no
-# quoting survives a shell, and written in py3.6-compatible syntax.
-# The set the convo miner itself ingests (convo_miner.CONVO_EXTENSIONS). The
-# sync ships exactly what a mine would pick up, so a synced machine and the
-# machine of origin file the same drawers: session transcripts, subagent
-# transcripts, tool-results/*.txt and memory/*.md alike.
 EXTENSIONS = (".jsonl", ".txt", ".md", ".json")
+PENDING = ".palace-sync-pending"
+PAD = "#" * 63 + "\n"
 
 MANIFEST_PROG = r"""
 import fnmatch, json, os, sys
@@ -79,12 +37,53 @@ for base, dirs, files in os.walk(root):
 print(json.dumps(out))
 """
 
-DEFAULT_EXCLUDE = []
+PACK_PROG = r"""
+import hashlib, json, os, sys, tarfile
+root, jobs = sys.argv[1], json.load(open(sys.argv[2]))
+sys.stdout.buffer.write(b"\n" * 64 + b"PALACE-SYNC\n")
+with tarfile.open(fileobj=sys.stdout.buffer, mode="w|", format=tarfile.PAX_FORMAT) as out:
+    for rel, off, end in jobs:
+        with open(os.path.join(root, *rel.split("/")), "rb") as f:
+            ti = tarfile.TarInfo(rel)
+            if off:
+                f.seek(max(off - 4096, 0))
+                pre = hashlib.sha256(f.read(off - max(off - 4096, 0))).hexdigest()
+                ti.size, ti.pax_headers = end - off, {"off": str(off), "pre": pre}
+            else:
+                ti.size = os.fstat(f.fileno()).st_size
+            out.addfile(ti, f)
+"""
+
+UNPACK_PROG = r"""
+import hashlib, json, os, shutil, sys, tarfile
+mirror, done, diverged = sys.argv[1], 0, []
+while sys.stdin.buffer.readline() not in (b"PALACE-SYNC\n", b""):
+    pass
+with tarfile.open(fileobj=sys.stdin.buffer, mode="r|") as t:
+    for m in t:
+        p, off = os.path.join(mirror, *m.name.split("/")), int(m.pax_headers.get("off", 0))
+        if off:
+            ok = os.path.isfile(p) and os.path.getsize(p) == off
+            if ok:
+                with open(p, "rb") as f:
+                    f.seek(max(off - 4096, 0))
+                    ok = hashlib.sha256(f.read(off - max(off - 4096, 0))).hexdigest() == m.pax_headers["pre"]
+            if not ok:
+                diverged.append(m.name)
+                continue
+            with open(p, "ab") as f:
+                shutil.copyfileobj(t.extractfile(m), f, 1 << 20)
+        else:
+            os.makedirs(os.path.dirname(p), exist_ok=True)
+            with open(p + ".part", "wb") as f:
+                shutil.copyfileobj(t.extractfile(m), f, 1 << 20)
+            os.replace(p + ".part", p)
+        done += 1
+print(json.dumps({"done": done, "diverged": diverged}))
+"""
 
 
 def scan(root: Path, skip=()):
-    """{'<project>/<relative path>': size} — must mirror MANIFEST_PROG exactly,
-    or the delta re-ships every run against a mirror that under-reports."""
     out = {}
     if not root.exists():
         return out
@@ -102,23 +101,12 @@ def scan(root: Path, skip=()):
 
 
 def wing_for(project_dir: str) -> str:
-    """`-Users-peterwang-code-golfcore` -> `_users_peterwang_code_golfcore`,
-    `C--Users-pewa-code-golfcore` -> `c__users_pewa_code_golfcore`."""
     from mempalace.config import normalize_wing_name
 
     return normalize_wing_name(project_dir)
 
 
 def run(cmd, **kw):
-    """check=True with the far side's stderr attached to the failure.
-
-    Scripts cross as bytes: text mode on Windows rewrites every \\n in `input` to
-    \\r\\n, and a POSIX shell then reads a tar target named `x.list\\r`.
-
-    CalledProcessError prints only the argv, and for an ssh call that argv is
-    `bash -s` — the actual command and its error live in the payload and the
-    stream, so a bare traceback says nothing about what went wrong.
-    """
     kw["input"] = kw["input"].encode() if "input" in kw else None
     p = subprocess.run(cmd, capture_output=True, **kw)
     p.stdout, p.stderr = (s.decode("utf-8", "replace") for s in (p.stdout, p.stderr))
@@ -132,100 +120,84 @@ def run(cmd, **kw):
 
 
 class Peer:
-    """One machine. Every snippet below is POSIX sh, on both sides.
-
-    The PC has no usable WSL and its OpenSSH hands commands to cmd.exe, but Git
-    Bash is a full MSYS shell with cat/tar/find/rm and it accepts the config's
-    `C:/...` paths. So a peer declares how to reach *a POSIX shell* — `shell` in
-    the config — and the script never emits PowerShell or cmd syntax at all.
-
-    Scripts travel on stdin, which is why every payload (the manifest program,
-    the tar file list) rides in a heredoc rather than being piped separately.
-    """
-
     def __init__(self, cfg, remote):
         self.__dict__.update(cfg)
         self.remote = remote
         self.shell = cfg.get("shell", "bash -s")
-        # GNU tar reads `C:/x` as host:path and tries to rsh to "C". MSYS tar
-        # takes --force-local; bsdtar on macOS rejects the flag outright, so it
-        # is conditional on the paths actually being Windows ones. Switching this
-        # peer to MSYS `/c/...` paths instead is not an option: they land in
-        # `source_file` at mine time and would refile the whole corpus.
-        self.tar_opt = "--force-local " if ":" in f"{self.tmp_dir}{self.mirror_dir}" else ""
+        self.pending = shlex.quote(f"{self.mirror_dir}/{PENDING}")
 
     def sh(self, script):
         if self.remote:
-            return run(["ssh", "-o", "BatchMode=yes", self.ssh, self.shell], input=script)
+            return run(["ssh", "-o", "BatchMode=yes", self.ssh, self.shell], input=PAD + script)
         return run(shlex.split(self.shell), input=script)
 
-    def tar_delta(self, tar: str, files: list):
-        """Archive exactly `files`, relative to this peer's projects_dir."""
-        body = "\n".join("./" + f for f in files)
+    def py(self, prog, *args):
+        argv = " ".join(map(shlex.quote, (self.python, "-", *args)))
+        return f"{argv} <<'PYEOF'\n{prog}\nPYEOF\n"
+
+    def seed(self, projects):
+        names = " ".join(map(shlex.quote, projects))
+        return (
+            f"mkdir -p {shlex.quote(self.mirror_dir)}\n"
+            f"test -e {self.pending} || printf '%s\\n' {names} > {self.pending}\n"
+        )
+
+    def stage(self, tag, prog, *args, data=None):
+        base = f"{self.tmp_dir}/palace-sync-{tag}"
+        argv = [self.python, f"{base}.py", *args] + ([f"{base}.json"] if data is not None else [])
+        files = (
+            {f"{base}.py": prog, f"{base}.json": json.dumps(data)}
+            if data is not None
+            else {f"{base}.py": prog}
+        )
+        if not self.remote:
+            for path, text in files.items():
+                Path(path).write_text(text)
+            return argv
+        files[f"{base}.sh"] = "exec " + " ".join(map(shlex.quote, argv)) + "\n"
         self.sh(
-            f"set -e\ncd {shlex.quote(self.projects_dir)}\n"
-            f"cat > {shlex.quote(tar)}.list <<'LIST'\n{body}\nLIST\n"
-            f"tar {self.tar_opt}-czf {shlex.quote(tar)} -T {shlex.quote(tar)}.list\n"
-            f"rm -f {shlex.quote(tar)}.list\n"
+            "".join(f"cat > {shlex.quote(k)} <<'PSEOF'\n{v}\nPSEOF\n" for k, v in files.items())
         )
+        bash = self.shell[: -len(" -s")] if self.shell.endswith(" -s") else self.shell
+        return ["ssh", "-o", "BatchMode=yes", self.ssh, f"{bash} {base}.sh"]
 
-    def tar_count(self, tar: str) -> int:
-        out = self.sh(f"tar {self.tar_opt}-tzf {shlex.quote(tar)} 2>/dev/null | wc -l")
-        return int(out.stdout.strip() or 0)
+    def queue(self, projects):
+        if not projects:
+            return []
+        out = self.sh(self.seed(projects) + f"sort -u {self.pending}")
+        return [p for p in out.stdout.splitlines() if p.strip()]
 
-    def sha256(self, path: str) -> str:
-        out = self.sh(
-            f"{shlex.quote(self.python)} - {shlex.quote(path)} <<'PYEOF'\n"
-            "import hashlib, sys\n"
-            "print(hashlib.sha256(open(sys.argv[1],'rb').read()).hexdigest())\n"
-            "PYEOF\n"
+    def mine(self, proj: str):
+        pre = f"{self.pre_mine} && " if getattr(self, "pre_mine", "") else ""
+        self.sh(
+            f"set -e\n{pre}PYTHONUNBUFFERED=1 PYTHONUTF8=1 PYTHONIOENCODING=utf-8 "
+            f"{shlex.quote(self.mempalace)} mine {shlex.quote(f'{self.mirror_dir}/{proj}')} "
+            f"--mode convos --cursor --wing {shlex.quote(wing_for(proj))}\n"
+            f"{{ grep -vxF -- {shlex.quote(proj)} {self.pending} || true; }} > {self.pending}.tmp\n"
+            f"mv {self.pending}.tmp {self.pending}\n"
         )
-        return out.stdout.strip().lower()
 
     def _remote_scan(self, root, skip=()):
-        r = self.sh(
-            f"{shlex.quote(self.python)} - {shlex.quote(root)} "
-            f"{shlex.quote('|'.join(skip))} <<'PYEOF'\n{MANIFEST_PROG}\nPYEOF\n"
-        )
-        return json.loads(r.stdout)
+        return json.loads(self.sh(self.py(MANIFEST_PROG, root, "|".join(skip))).stdout)
 
     def manifest(self):
-        """{'<project>/<relative path>': size} for everything a mine would ingest."""
-        skip = getattr(self, "exclude", None) or DEFAULT_EXCLUDE
+        skip = getattr(self, "exclude", ())
         if self.remote:
             return self._remote_scan(self.projects_dir, skip)
         return scan(Path(self.projects_dir), skip)
 
     def mirror_manifest(self):
-        """Same shape, for the copy of the *other* machine's transcripts held here."""
         if self.remote:
             return self._remote_scan(self.mirror_dir)
         return scan(Path(self.mirror_dir))
 
 
 def delta(src: dict, dst: dict):
-    """Files the destination is missing or holds a different-sized copy of.
-
-    Session transcripts (.jsonl) are append-only, so a mirror copy longer than
-    the source means the source lost data, and the longer copy is kept. Memory
-    notes and other .md/.txt/.json files are edited in place and may shrink;
-    those ship whenever the size differs.
-    """
-    shortened = [k for k, n in src.items() if k.endswith(".jsonl") and dst.get(k, -1) > n]
-    if shortened:
-        raise SystemExit(
-            f"Source transcripts shrank; preserving longer mirror copies: {shortened[:5]}"
-        )
-    return sorted(k for k, n in src.items() if dst.get(k, -1) != n)
+    held = {k for k, n in src.items() if k.endswith(".jsonl") and dst.get(k, -1) > n}
+    return sorted(k for k, n in src.items() if dst.get(k, -1) != n and k not in held), sorted(held)
 
 
 def source_pairs(cfg, selected="all"):
-    """Keep Claude's existing addresses; opt Codex into a separate fixed mirror.
-
-    Codex sources are hook exports grouped by origin wing, never raw rollout
-    YYYY/MM/DD directories or history databases. Validate every pair before any
-    transfer so a partial configuration cannot silently omit one direction.
-    """
     pairs = []
     sides = [cfg["local"], cfg["remote"]]
     codex_keys = ("codex_projects_dir", "codex_mirror_dir")
@@ -236,8 +208,6 @@ def source_pairs(cfg, selected="all"):
         if not side.get("projects_dir") or not side.get("mirror_dir"):
             raise SystemExit(f"{side['name']}: mirror_dir and projects_dir are both required")
         if has_codex:
-            # Sources and mirrors must not overlap, including a Codex mirror
-            # nested beneath the old Claude mirror (which mines recursively).
             paths = [
                 side[key].replace("\\", "/").rstrip("/").lower()
                 for key in ("projects_dir", "mirror_dir", *codex_keys)
@@ -270,89 +240,65 @@ def source_pairs(cfg, selected="all"):
 
 
 def sync(src: Peer, dst: Peer, label: str, args) -> int:
-    print(f"\n=== {label}: {src.name} -> {dst.name}")
+    def say(line):
+        print(f"[{label}] {line}", flush=True)
+
     have, mine = src.manifest(), dst.mirror_manifest()
-    todo = delta(have, mine)
+    todo, held = delta(have, mine)
     new = [f for f in todo if f not in mine]
-    print(f"    {len(have)} transcripts on {src.name}, {len(mine)} in {dst.name}'s mirror")
-    print(f"    delta: {len(todo)} to ship ({len(new)} new, {len(todo) - len(new)} grown)")
+    say(f"{src.name} -> {dst.name}: {len(have)} transcripts, {len(mine)} in mirror")
+    say(f"delta: {len(todo)} to ship ({len(new)} new, {len(todo) - len(new)} grown)")
+    if held:
+        say(f"held: {len(held)} shrank on {src.name}; keeping the longer mirror copy")
     if args.verbose:
         for f in todo[:20]:
-            print(f"      {'NEW ' if f in new else 'GROW'} {f}")
+            say(f"  {'NEW ' if f in new else 'GROW'} {f}")
+        for f in held:
+            say(f"  HELD {f}")
         if len(todo) > 20:
-            print(f"      ... {len(todo) - 20} more")
+            say(f"  ... {len(todo) - 20} more")
     if args.dry_run:
-        print("    (dry run, stopping here)")
         return 0
+    projects = sorted({k.split("/")[0] for k in (*mine, *todo)})
     if todo:
-        ship(src, dst, todo)
-    else:
-        print("    nothing new to ship")
-
-    # Mine every project in the mirror, not just what moved on this run. Shipping
-    # and mining are separate failures: an interrupted mine leaves the mirror
-    # complete and the palace short, and a delta computed from the mirror is then
-    # empty forever after — the run exits 0 with eight projects never filed. That
-    # happened on 2026-08-06. The cursor and the already-filed check make the
-    # re-scan cheap; correctness here is worth more than the seconds it costs.
-    projects = sorted({k.split("/")[0] for k in dst.mirror_manifest()})
-    for proj in projects:
-        wing = wing_for(proj)
-        path = f"{dst.mirror_dir}/{proj}"
-        print(f"    mining {proj} -> wing {wing}")
-        env = "PYTHONUNBUFFERED=1 PYTHONUTF8=1 PYTHONIOENCODING=utf-8"
-        pre = f"{dst.pre_mine} && " if getattr(dst, "pre_mine", "") else ""
+        jobs = [[f, mine.get(f, 0) if f.endswith(".jsonl") else 0, have[f]] for f in todo]
         dst.sh(
-            f"{pre}{env} {shlex.quote(dst.mempalace)} mine {shlex.quote(path)} "
-            f"--mode convos --cursor --wing {shlex.quote(wing)}"
+            dst.seed(projects)
+            + f"printf '%s\\n' {' '.join(map(shlex.quote, sorted({f.split('/')[0] for f in todo})))}"
+            + f" >> {dst.pending}\n"
         )
+        r = stream(src, dst, jobs, label)
+        if r["diverged"]:
+            say(f"{len(r['diverged'])} mirror copies diverged from source; shipping them whole")
+            stream(src, dst, [[f, 0, have[f]] for f in r["diverged"]], label)
+        say(f"shipped {sum(e - o for _, o, e in jobs):,} bytes")
+    queue = dst.queue(projects)
+    say(f"mining {len(queue)} of {len(projects)} projects")
+    for proj in queue:
+        say(f"mining {proj} -> wing {wing_for(proj)}")
+        dst.mine(proj)
     return len(todo)
 
 
-def ship(src: Peer, dst: Peer, todo: list) -> None:
-    """Archive the delta, move it, verify it, and extract into the mirror."""
-    stamp = os.environ.get("PALACE_SYNC_STAMP", "sync")
-    tar_name = f"palace-sync-{src.name}-to-{dst.name}-{stamp}.tar.gz"
-    src_tar = f"{src.tmp_dir}/{tar_name}"
-    dst_tar = f"{dst.tmp_dir}/{tar_name}"
-
-    # Build the archive from an explicit file list: nothing but the delta can end
-    # up inside it.
-    src.tar_delta(src_tar, todo)
-
-    held = src.tar_count(src_tar)
-    if held < len(todo):
+def stream(src: Peer, dst: Peer, jobs: list, label: str) -> dict:
+    tag = label.lower().replace(" ", "-")
+    pack = src.stage(f"{tag}-pack", PACK_PROG, src.projects_dir, data=jobs)
+    unpack = dst.stage(f"{tag}-unpack", UNPACK_PROG, dst.mirror_dir)
+    p = subprocess.Popen(pack, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE)
+    q = subprocess.run(unpack, stdin=p.stdout, capture_output=True)
+    p.stdout.close()
+    p.wait()
+    out, err = (s.decode("utf-8", "replace") for s in (q.stdout, q.stderr))
+    if p.returncode or q.returncode:
         raise SystemExit(
-            f"{tar_name} holds {held} entries for a {len(todo)}-file delta - "
-            f"refusing to ship. sha256 cannot catch this: an empty archive "
-            f"transfers faithfully and matches on both sides."
+            f"stream failed: pack exit {p.returncode}, unpack exit {q.returncode}\n{err[-4000:]}"
         )
-
-    # Move it. scp needs one local and one remote endpoint.
-    if src.remote and not dst.remote:
-        run(["scp", "-q", f"{src.ssh}:{src_tar}", dst_tar])
-    elif dst.remote and not src.remote:
-        run(["scp", "-q", src_tar, f"{dst.ssh}:{dst_tar}"])
-    else:
-        raise SystemExit("one side must be local")
-
-    # Integrity, because a truncated archive extracts to a plausible-looking subset.
-    if src.sha256(src_tar) != dst.sha256(dst_tar):
-        raise SystemExit(f"checksum mismatch shipping {tar_name} - aborting before extract")
-    print(f"    shipped {tar_name}, sha256 verified")
-
-    # Extract into the permanent mirror. Never anywhere else.
-    dst.sh(
-        f"set -e\nmkdir -p {shlex.quote(dst.mirror_dir)}\n"
-        f"tar {dst.tar_opt}-xzf {shlex.quote(dst_tar)} -C {shlex.quote(dst.mirror_dir)}\n"
-        f"find {shlex.quote(dst.mirror_dir)} -name '._*' -delete\n"
-        f"rm -f {shlex.quote(dst_tar)}\n"
-    )
-
-    # Nothing is pruned from the mirror. The hooks on the machine of origin mine
-    # its whole project tree — subagents, tool-results and memory included — so a
-    # mirror that dropped them would hold strictly less than the palace it mirrors.
-    # `._*` goes because macOS tar emits AppleDouble stubs that match *.jsonl.
+    r = json.loads(out.strip().splitlines()[-1])
+    if r["done"] + len(r["diverged"]) != len(jobs):
+        raise SystemExit(
+            f"stream applied {r['done']} + {len(r['diverged'])} diverged of {len(jobs)} files"
+        )
+    return r
 
 
 def main():
@@ -373,14 +319,27 @@ def main():
     cfg_path = Path(args.config)
     if not cfg_path.exists():
         sys.exit(f"no config at {cfg_path}\nCopy palace_sync.config.example.json and fill it in.")
-    cfg = json.loads(cfg_path.read_text())
-    moved = 0
-    for source, local, remote in source_pairs(cfg, args.source):
-        if not args.push_only:
-            moved += sync(remote, local, f"PULL {source}", args)
-        if not args.pull_only:
-            moved += sync(local, remote, f"PUSH {source}", args)
-    print(f"\ndone â€” {moved} transcript(s) moved")
+    pairs = source_pairs(json.loads(cfg_path.read_text()), args.source)
+    lanes = [
+        [(there, here, f"PULL {s}") for s, here, there in pairs] * (not args.push_only),
+        [(here, there, f"PUSH {s}") for s, here, there in pairs] * (not args.pull_only),
+    ]
+    moved, failed = [], []
+
+    def drive(lane):
+        try:
+            moved.extend(sync(src, dst, label, args) for src, dst, label in lane)
+        except BaseException as e:
+            failed.append(e)
+            print(f"\n{e}", file=sys.stderr, flush=True)
+
+    with ThreadPoolExecutor(2) as ex:
+        list(ex.map(drive, lanes))
+    print(
+        f"\ndone: {sum(moved)} transcript(s) moved"
+        + (f", {len(failed)} lane(s) failed" if failed else "")
+    )
+    sys.exit(1 if failed else 0)
 
 
 if __name__ == "__main__":
